@@ -1023,8 +1023,11 @@ void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {
         LorieBuffer_release((LorieBuffer *) dst_buffer);
 }
 
-Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unused uint64_t target_msc, PixmapPtr pixmap, __unused Bool sync_flip) {
+Bool loriePresentFlip(RRCrtcPtr crtc, uint64_t event_id, uint64_t target_msc, PixmapPtr pixmap, __unused Bool sync_flip) {
     LoriePixmapPriv* priv = (LoriePixmapPriv*) exaGetPixmapDriverPrivate(pixmap);
+    uint64_t completionMsc;
+    static BoxRec box = { 0, 0, 1, 1 }; // lorieRedraw only checks if it is empty or not.
+
     if (!priv || !priv->buffer || priv->mem || pvfb->root.width != pixmap->drawable.width || pvfb->root.height != pixmap->drawable.height)
         return FALSE;
 
@@ -1040,18 +1043,16 @@ Bool loriePresentFlip(__unused RRCrtcPtr crtc, __unused uint64_t event_id, __unu
         return FALSE;
 
     lorieRegisterBuffer(priv->buffer);
-    return TRUE;
-}
-
-void loriePresentAfterFlip(__unused RRCrtcPtr crtc, uint64_t event_id, uint64_t ust, uint64_t target_msc, __unused PixmapPtr pixmap) {
-    // X server was patched to call this function right after finishing all present_flip shenanigans
-    // Since we do not invoke DRM API or anything similar we do not need to implement this as callback
-    // For some reason calling present_event_notify in BlockHandler or as QueueWorkProc/eventfd callback
-    // adds some delay which may be easily avoided this way.
-    static BoxRec box = { 0, 0, 1, 1 }; // lorieRedraw only checks if it is empty or not.
     RegionReset(DamageRegion(pvfb->damage), &box);
-    pvfb->current_msc = min(pvfb->current_msc + 1, target_msc);
-    present_event_notify(event_id, ust, pvfb->current_msc);
+
+    // A successful Present flip must complete when it becomes visible, not while
+    // present_execute() is still changing the screen pixmap. Android displays the
+    // renderer's next swap on a Choreographer vblank, so report completion there.
+    completionMsc = max(target_msc, pvfb->current_msc + 1);
+    if (loriePresentQueueVblank(crtc, event_id, completionMsc) != Success)
+        return FALSE;
+
+    return TRUE;
 }
 
 void loriePresentUnflip(__unused ScreenPtr screen, uint64_t event_id) {
@@ -1068,7 +1069,6 @@ static struct present_screen_info loriePresentInfo = {
         // Since there are no other drivers involved here we assume it always fits.
         .check_flip = TrueNoop,
         .flip = loriePresentFlip,
-        .after_flip = loriePresentAfterFlip,
         .unflip = loriePresentUnflip,
 };
 
