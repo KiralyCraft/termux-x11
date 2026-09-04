@@ -83,6 +83,14 @@ typedef struct {
     uint64_t vblank_interval;
     struct xorg_list vblank_queue;
     uint64_t current_msc;
+    uint64_t last_vblank_ust;
+
+    /* Choreographer runs outside the X server thread. Keep at most one redraw
+     * work item queued and fold any intervening callbacks into one MSC step. */
+    pthread_mutex_t vblank_lock;
+    uint64_t pending_vblanks;
+    uint64_t pending_vblank_ust;
+    Bool redraw_queued;
 
     uint64_t gpuCopySerialCounter;
     uint64_t rootGpuCopyPending;
@@ -97,6 +105,7 @@ static lorieScreenInfo lorieScreen = {
         .root.name = "screen",
         .dri3 = TRUE,
         .vblank_queue = { &lorieScreen.vblank_queue, &lorieScreen.vblank_queue },
+        .vblank_lock = PTHREAD_MUTEX_INITIALIZER,
 }, *pvfb = &lorieScreen;
 static char *xstartup = NULL;
 static char **xstartupArgv = NULL;
@@ -503,10 +512,22 @@ static void loriePerformVblanks(void);
 
 static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     int status, nonEmpty;
+    uint64_t pendingVblanks, vblankUst;
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
 
-    pvfb->current_msc++;
+    pthread_mutex_lock(&pvfb->vblank_lock);
+    pendingVblanks = pvfb->pending_vblanks;
+    vblankUst = pvfb->pending_vblank_ust;
+    pvfb->pending_vblanks = 0;
+    pvfb->redraw_queued = FALSE;
+    pthread_mutex_unlock(&pvfb->vblank_lock);
+
+    if (!pendingVblanks)
+        return TRUE;
+
+    pvfb->current_msc += pendingVblanks;
+    pvfb->last_vblank_ust = vblankUst;
     loriePerformVblanks();
 
     pvfb->state->waitForNextFrame = false;
@@ -731,10 +752,29 @@ static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused 
 }
 
 void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d) {
+    Bool queueRedraw = FALSE;
+
     AChoreographer_postFrameCallback(d, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, d);
     if (pScreenPtr) {
-        QueueWorkProc(lorieRedraw, NULL, NULL);
-        lorieWakeServer();
+        pthread_mutex_lock(&pvfb->vblank_lock);
+        pvfb->pending_vblanks++;
+        pvfb->pending_vblank_ust = GetTimeInMicros();
+        if (!pvfb->redraw_queued) {
+            pvfb->redraw_queued = TRUE;
+            queueRedraw = TRUE;
+        }
+        pthread_mutex_unlock(&pvfb->vblank_lock);
+
+        if (queueRedraw) {
+            if (QueueWorkProc(lorieRedraw, NULL, NULL)) {
+                lorieWakeServer();
+            } else {
+                /* Retain the pending count so the next callback can retry. */
+                pthread_mutex_lock(&pvfb->vblank_lock);
+                pvfb->redraw_queued = FALSE;
+                pthread_mutex_unlock(&pvfb->vblank_lock);
+            }
+        }
     }
 }
 
@@ -838,14 +878,15 @@ void InitOutput(ScreenInfo * screen_info, int argc, char **argv) {
     }
 }
 
-// This Present implementation mostly copies the one from `present/present_fake.c`
-// The only difference is performing vblanks right before redrawing root window (in lorieRedraw) instead of using timers.
+// This Present implementation mostly copies the one from `present/present_fake.c`.
+// Choreographer callbacks replace timers; delayed callbacks are coalesced before
+// advancing MSC so the server cannot replay stale vblanks in a burst.
 static RRCrtcPtr loriePresentGetCrtc(WindowPtr w) {
     return RRFirstEnabledCrtc(w->drawable.pScreen);
 }
 
 static int loriePresentGetUstMsc(__unused RRCrtcPtr crtc, uint64_t *ust, uint64_t *msc) {
-    *ust = GetTimeInMicros();
+    *ust = pvfb->last_vblank_ust ? pvfb->last_vblank_ust : GetTimeInMicros();
     *msc = pvfb->current_msc;
     return Success;
 }
@@ -880,7 +921,9 @@ static void loriePerformVblanks(void) {
     struct vblank *vblank, *tmp;
     xorg_list_for_each_entry_safe(vblank, tmp, &pvfb->vblank_queue, link) {
         if (vblank->msc <= pvfb->current_msc) {
-            present_event_notify(vblank->id, GetTimeInMicros(), pvfb->current_msc);
+            present_event_notify(vblank->id,
+                                 pvfb->last_vblank_ust ? pvfb->last_vblank_ust : GetTimeInMicros(),
+                                 pvfb->current_msc);
             xorg_list_del(&vblank->link);
             free (vblank);
         }
