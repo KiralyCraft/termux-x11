@@ -320,6 +320,8 @@ void Renderer::resetPresentFeedback(bool notifyUnknown) {
 }
 
 void Renderer::configurePresentFeedbackSurface() {
+    EGLBoolean supported;
+
     resetPresentFeedback(true);
     presentFeedbackSurfaceGeneration++;
     presentFeedbackPollSerialSeen = state
@@ -330,12 +332,28 @@ void Renderer::configurePresentFeedbackSurface() {
         sfc == defaultSfc || !presentFeedbackExtensionAvailable)
         return;
 
-    presentFeedbackSurfaceEnabled =
-        getFrameTimestampSupportedANDROID(egl_display, sfc,
-                                          EGL_DISPLAY_PRESENT_TIME_ANDROID) == EGL_TRUE;
-    log("DEBUG: Android presentation timestamps %s for surface generation %u",
-        presentFeedbackSurfaceEnabled ? "enabled" : "unsupported",
-        presentFeedbackSurfaceGeneration);
+    supported = getFrameTimestampSupportedANDROID(
+        egl_display, sfc, EGL_DISPLAY_PRESENT_TIME_ANDROID);
+    if (supported == EGL_TRUE) {
+        /* Support and collection are separate in
+         * EGL_ANDROID_get_frame_timestamps. Queries return EGL_BAD_SURFACE
+         * until collection is explicitly enabled for this window surface. */
+        presentFeedbackSurfaceEnabled =
+            eglSurfaceAttrib(egl_display, sfc, EGL_TIMESTAMPS_ANDROID,
+                             EGL_TRUE) == EGL_TRUE;
+    }
+
+    if (presentFeedbackSurfaceEnabled) {
+        log("DEBUG: Android presentation timestamps enabled for surface generation %u",
+            presentFeedbackSurfaceGeneration);
+    } else if (supported == EGL_TRUE) {
+        EGLint error = eglGetError();
+        loge("DEBUG: failed to enable Android presentation timestamps for surface generation %u: EGL error 0x%x",
+             presentFeedbackSurfaceGeneration, error);
+    } else {
+        log("DEBUG: Android presentation timestamps unsupported for surface generation %u",
+            presentFeedbackSurfaceGeneration);
+    }
 }
 
 void Renderer::recordPresentFeedback(uint64_t gpuCopySerial, int64_t submitNs,
@@ -391,7 +409,27 @@ void Renderer::pollPresentFeedback() {
             notifyPresentFeedback(pending, LORIE_PRESENT_FEEDBACK_PRESENTED,
                                   (int64_t) presentNs);
             pending.valid = false;
-        } else if ((queried == EGL_TRUE && presentNs == EGL_TIMESTAMP_INVALID_ANDROID) ||
+        } else if (queried == EGL_FALSE) {
+            EGLint error = eglGetError();
+            notifyPresentFeedback(pending, LORIE_PRESENT_FEEDBACK_UNKNOWN, 0);
+            pending.valid = false;
+            if (error == EGL_BAD_SURFACE) {
+                /* The surface was retired or timestamp collection was lost.
+                 * Stop querying immediately instead of producing log spam. */
+                loge("DEBUG: Android presentation timestamp surface became invalid; disabling generation %u",
+                     presentFeedbackSurfaceGeneration);
+                presentFeedbackSurfaceEnabled = false;
+                for (uint32_t rest = cursor + 1; rest != presentFeedbackWrite; rest++) {
+                    PendingPresentFeedback& abandoned =
+                        pendingPresentFeedback[rest % PRESENT_FEEDBACK_QUEUE_CAPACITY];
+                    if (abandoned.valid)
+                        notifyPresentFeedback(abandoned,
+                                              LORIE_PRESENT_FEEDBACK_UNKNOWN, 0);
+                    abandoned.valid = false;
+                }
+                break;
+            }
+        } else if (presentNs == EGL_TIMESTAMP_INVALID_ANDROID ||
                    nowNs - pending.submitNs >= 2000000000LL) {
             /* Invalid means the frame did not acquire an actual display time;
              * timeout is terminally unknown, never a fabricated presentation. */
