@@ -445,6 +445,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                                            e.presentFeedback.surfaceGeneration,
                                            e.presentFeedback.rendererSerial,
                                            e.presentFeedback.gpuCopySerial,
+                                           e.presentFeedback.presentTag,
                                            e.presentFeedback.eglFrameId,
                                            e.presentFeedback.submitNs,
                                            e.presentFeedback.presentNs);

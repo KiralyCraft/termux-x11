@@ -100,6 +100,7 @@ typedef struct {
 
     uint64_t gpuCopySerialCounter;
     uint64_t rootGpuCopyPending;
+    uint64_t presentTagCounter;
 
     /* DEBUG: aggregate actual Android display feedback without changing X
      * Present completion semantics. Updated from the socket input thread. */
@@ -108,6 +109,8 @@ typedef struct {
     uint64_t presentFeedbackUnknown;
     uint64_t presentFeedbackLatencyTotalNs;
     uint64_t presentFeedbackLatencyMaxNs;
+    uint64_t presentFeedbackCorrelated;
+    uint64_t presentFeedbackUncorrelated;
 } lorieScreenInfo;
 
 ScreenPtr pScreenPtr;
@@ -623,6 +626,7 @@ static uint64_t gpuCopyAttempts = 0, gpuCopyOffloads = 0;
 
 void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
                                 uint64_t renderer_serial, uint64_t gpu_copy_serial,
+                                LoriePresentTag present_tag,
                                 uint64_t egl_frame_id, int64_t submit_ns,
                                 int64_t present_ns) {
     if (status == LORIE_PRESENT_FEEDBACK_PRESENTED && present_ns > submit_ns &&
@@ -634,12 +638,18 @@ void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
         pvfb->presentFeedbackLatencyTotalNs += latency;
         if (latency > pvfb->presentFeedbackLatencyMaxNs)
             pvfb->presentFeedbackLatencyMaxNs = latency;
+        if (present_tag.tag)
+            pvfb->presentFeedbackCorrelated++;
+        else
+            pvfb->presentFeedbackUncorrelated++;
         pthread_mutex_unlock(&pvfb->presentFeedbackLock);
 
         if (loriePresentFeedbackVerbose)
-            log(INFO, "DEBUG: present feedback generation=%u renderer=%llu copy=%llu egl=%llu submit=%lld present=%lld latency=%.3fms",
+            log(INFO, "DEBUG: present feedback generation=%u renderer=%llu copy=%llu tag=%llu window=0x%x serial=%u egl=%llu submit=%lld present=%lld latency=%.3fms",
                 surface_generation, (unsigned long long) renderer_serial,
                 (unsigned long long) gpu_copy_serial,
+                (unsigned long long) present_tag.tag, present_tag.window,
+                present_tag.serial,
                 (unsigned long long) egl_frame_id, (long long) submit_ns,
                 (long long) present_ns, (double) latency / 1000000.0);
     } else {
@@ -647,25 +657,31 @@ void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
         pvfb->presentFeedbackUnknown++;
         pthread_mutex_unlock(&pvfb->presentFeedbackLock);
         if (loriePresentFeedbackVerbose)
-            log(INFO, "DEBUG: present feedback unknown generation=%u renderer=%llu copy=%llu egl=%llu submit=%lld",
+            log(INFO, "DEBUG: present feedback unknown generation=%u renderer=%llu copy=%llu tag=%llu window=0x%x serial=%u egl=%llu submit=%lld",
                 surface_generation, (unsigned long long) renderer_serial,
                 (unsigned long long) gpu_copy_serial,
+                (unsigned long long) present_tag.tag, present_tag.window,
+                present_tag.serial,
                 (unsigned long long) egl_frame_id, (long long) submit_ns);
     }
 }
 
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
-    uint64_t actual, unknown, totalNs, maxNs;
+    uint64_t actual, unknown, totalNs, maxNs, correlated, uncorrelated;
 
     pthread_mutex_lock(&pvfb->presentFeedbackLock);
     actual = pvfb->presentFeedbackPresented;
     unknown = pvfb->presentFeedbackUnknown;
     totalNs = pvfb->presentFeedbackLatencyTotalNs;
     maxNs = pvfb->presentFeedbackLatencyMaxNs;
+    correlated = pvfb->presentFeedbackCorrelated;
+    uncorrelated = pvfb->presentFeedbackUncorrelated;
     pvfb->presentFeedbackPresented = 0;
     pvfb->presentFeedbackUnknown = 0;
     pvfb->presentFeedbackLatencyTotalNs = 0;
     pvfb->presentFeedbackLatencyMaxNs = 0;
+    pvfb->presentFeedbackCorrelated = 0;
+    pvfb->presentFeedbackUncorrelated = 0;
     pthread_mutex_unlock(&pvfb->presentFeedbackLock);
 
     if (pvfb->state->renderedFrames || gpuCopyAttempts)
@@ -674,8 +690,10 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             pvfb->state->renderedFrames, ((float) pvfb->state->renderedFrames) / 5,
             (unsigned long long) gpuCopyOffloads, (unsigned long long) gpuCopyAttempts);
     if (actual || unknown)
-        log(INFO, "DEBUG: Android presentation feedback: %llu actual, %llu unknown, mean %.3fms, max %.3fms",
+        log(INFO, "DEBUG: Android presentation feedback: %llu actual, %llu unknown, %llu correlated, %llu renderer-only, mean %.3fms, max %.3fms",
             (unsigned long long) actual, (unsigned long long) unknown,
+            (unsigned long long) correlated,
+            (unsigned long long) uncorrelated,
             actual ? (double) totalNs / (double) actual / 1000000.0 : 0.0,
             (double) maxNs / 1000000.0);
     pvfb->state->renderedFrames = 0;
@@ -1161,12 +1179,54 @@ bool lorieRendererAvailable(void) {
     return pvfb->state->surfaceAvailable;
 }
 
+/* DEBUG: Allocate correlation identities only for Present operations which
+ * write the screen pixmap sampled by the Android renderer.  Redirected window
+ * backing pixmaps need a later compositor-aware correlation path; labelling
+ * them as physically presented here would be false precision. */
+uint64_t loriePreparePresentTag(WindowPtr window, PixmapPtr dst) {
+    PixmapPtr root;
+
+    if (!window || !dst || !pvfb->state ||
+        !pvfb->state->presentFeedbackEnabled)
+        return 0;
+    root = window->drawable.pScreen->GetScreenPixmap(window->drawable.pScreen);
+    if (dst != root)
+        return 0;
+    return ++pvfb->presentTagCounter;
+}
+
+/* DEBUG: Publish CPU-copy/flip identity after its root contents are ready to
+ * be sampled.  The renderer uses the version as a seqlock and never treats
+ * this timing metadata as producer completion or storage release. */
+void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial) {
+    uint32_t version;
+
+    if (!tag || !pvfb->state)
+        return;
+    version = __atomic_load_n(&pvfb->state->latestPresentTag.version,
+                              __ATOMIC_RELAXED);
+    if (version & 1)
+        version++;
+    __atomic_store_n(&pvfb->state->latestPresentTag.version, version + 1,
+                     __ATOMIC_RELEASE);
+    __atomic_store_n(&pvfb->state->latestPresentTag.value.tag, tag,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->latestPresentTag.value.window, window,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->latestPresentTag.value.serial, serial,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->latestPresentTag.version, version + 2,
+                     __ATOMIC_RELEASE);
+}
+
 // Tries to offload a Present "copy" operation (present_execute_copy) to the renderer's GPU
 // context instead of doing a CPU CopyArea here. dst is whatever GetWindowPixmap(window) is - root
 // for a plain window, or a Composite-redirected window's own backing pixmap. Returns FALSE
 // (caller falls back to the regular CPU present_copy_region) whenever either buffer isn't
 // GPU-sampleable, or the deferred copy queue is currently full.
 Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
+                              uint64_t present_tag, uint32_t present_window,
+                              uint32_t present_serial,
                               uint64_t *out_serial, void **out_dst_buffer) {
     LorieBuffer *srcBuffer, *dstBuffer;
     LoriePixmapPriv *priv;
@@ -1256,6 +1316,11 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     entry->serial = ++pvfb->gpuCopySerialCounter;
     entry->srcBufferId = desc->id;
     entry->dstBufferId = dstDesc->id;
+    entry->presentTag = (LoriePresentTag) {
+        .tag = present_tag,
+        .window = present_window,
+        .serial = present_serial,
+    };
     entry->xOff = x_off;
     entry->yOff = y_off;
     entry->numRects = (uint16_t) numRects;

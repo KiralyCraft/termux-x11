@@ -70,6 +70,37 @@ static bool hasEglExtension(const char* extensions, const char* wanted) {
     return false;
 }
 
+/* DEBUG: Read the X server's latest root-visible Present identity without
+ * taking another inter-process mutex.  Every field is loaded atomically and
+ * the version is checked twice, so a concurrent publication is retried rather
+ * than producing a mixed window/serial/tag tuple. */
+static bool readPublishedPresentTag(const lorie_shared_server_state* state,
+                                    LoriePresentTag* out) {
+    uint32_t before, after;
+
+    if (!state || !out)
+        return false;
+
+    for (;;) {
+        before = __atomic_load_n(&state->latestPresentTag.version,
+                                 __ATOMIC_ACQUIRE);
+        if (before & 1)
+            continue;
+        out->tag = __atomic_load_n(&state->latestPresentTag.value.tag,
+                                   __ATOMIC_RELAXED);
+        out->window = __atomic_load_n(&state->latestPresentTag.value.window,
+                                      __ATOMIC_RELAXED);
+        out->serial = __atomic_load_n(&state->latestPresentTag.value.serial,
+                                      __ATOMIC_RELAXED);
+        after = __atomic_load_n(&state->latestPresentTag.version,
+                                __ATOMIC_ACQUIRE);
+        if (before == after && !(after & 1))
+            break;
+    }
+
+    return out->tag != 0;
+}
+
 /* DEBUG: Stage-E validation only.  This deliberately does not advertise a
  * direct-presentation capability or alter the production renderer.  A buffer
  * which can be imported for sampling is not necessarily a legal render
@@ -298,6 +329,7 @@ void Renderer::notifyPresentFeedback(const PendingPresentFeedback& pending,
     event.presentFeedback.surfaceGeneration = pending.surfaceGeneration;
     event.presentFeedback.rendererSerial = pending.rendererSerial;
     event.presentFeedback.gpuCopySerial = pending.gpuCopySerial;
+    event.presentFeedback.presentTag = pending.presentTag;
     event.presentFeedback.eglFrameId = pending.eglFrameId;
     event.presentFeedback.submitNs = pending.submitNs;
     event.presentFeedback.presentNs = presentNs;
@@ -321,9 +353,16 @@ void Renderer::resetPresentFeedback(bool notifyUnknown) {
 
 void Renderer::configurePresentFeedbackSurface() {
     EGLBoolean supported;
+    LoriePresentTag current{};
 
     resetPresentFeedback(true);
     presentFeedbackSurfaceGeneration++;
+    latestContentPresentTag = {};
+    if (readPublishedPresentTag(state, &current))
+        latestContentPresentTag = current;
+    /* Content which predates this Android surface is not attributed to a new
+     * application frame merely because the surface needs its initial redraw. */
+    lastSubmittedPresentTag = latestContentPresentTag.tag;
     presentFeedbackPollSerialSeen = state
         ? __atomic_load_n(&state->presentFeedbackPollSerial, __ATOMIC_ACQUIRE)
         : 0;
@@ -356,7 +395,9 @@ void Renderer::configurePresentFeedbackSurface() {
     }
 }
 
-void Renderer::recordPresentFeedback(uint64_t gpuCopySerial, int64_t submitNs,
+void Renderer::recordPresentFeedback(uint64_t gpuCopySerial,
+                                     const LoriePresentTag& presentTag,
+                                     int64_t submitNs,
                                      EGLuint64KHR eglFrameId) {
     if (!presentFeedbackSurfaceEnabled || !state || !state->presentFeedbackEnabled)
         return;
@@ -376,6 +417,7 @@ void Renderer::recordPresentFeedback(uint64_t gpuCopySerial, int64_t submitNs,
     pending.surfaceGeneration = presentFeedbackSurfaceGeneration;
     pending.rendererSerial = ++rendererPresentSerial;
     pending.gpuCopySerial = gpuCopySerial;
+    pending.presentTag = presentTag;
     pending.eglFrameId = eglFrameId;
     pending.submitNs = submitNs;
     presentFeedbackWrite++;
@@ -1162,6 +1204,12 @@ uint64_t Renderer::applyPendingGpuCopiesLocked() {
                     LorieBuffer_getGLTextureId(src), LorieBuffer_getGLTextureId(dst), needsSwizzle);
                 drawRegion(0, x0, y0, x1, y1, u0, v0, u1, v1, needsSwizzle);
             }
+
+            /* The GPU copy is part of this renderer submission.  Preserve the
+             * newest root-visible Present identity across a standalone queue
+             * drain so the subsequent Android redraw can still claim it. */
+            if (entry.presentTag.tag > latestContentPresentTag.tag)
+                latestContentPresentTag = entry.presentTag;
         }
 
         lastSerial = entry.serial;
@@ -1337,6 +1385,13 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     lorie_mutex_lock(&state->lock, &state->lockingPid);
     // Share this draw's flush+fence below instead of a separate round trip per frame.
     uint64_t gpuCopySerial = applyPendingGpuCopiesLocked();
+    LoriePresentTag publishedPresentTag{};
+    if (readPublishedPresentTag(state, &publishedPresentTag) &&
+        publishedPresentTag.tag > latestContentPresentTag.tag)
+        latestContentPresentTag = publishedPresentTag;
+    LoriePresentTag framePresentTag{};
+    if (latestContentPresentTag.tag > lastSubmittedPresentTag)
+        framePresentTag = latestContentPresentTag;
     state->drawRequested = FALSE;
 
     LorieBuffer_bindTexture(buffer);
@@ -1380,8 +1435,13 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
 
     if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
         printEglError("Failed to swap buffers", __LINE__);
-    else if (trackPresent)
-        recordPresentFeedback(gpuCopySerial, submitNs, eglFrameId);
+    else {
+        if (framePresentTag.tag)
+            lastSubmittedPresentTag = framePresentTag.tag;
+        if (trackPresent)
+            recordPresentFeedback(gpuCopySerial, framePresentTag, submitNs,
+                                  eglFrameId);
+    }
 
     // Perform a little drawing operation to make sure the next buffer is ready on the next invocation of drawing
     glEnable(GL_SCISSOR_TEST);

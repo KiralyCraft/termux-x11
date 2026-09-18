@@ -30,6 +30,16 @@
 #define LORIE_PRESENT_FEEDBACK_PRESENTED 1
 #define LORIE_PRESENT_FEEDBACK_UNKNOWN   2
 
+/* DEBUG: Identity of the newest X Present whose contents were incorporated
+ * into an Android renderer frame.  tag is server-monotonic and is the
+ * publication/correlation key; window and serial retain the originating
+ * Present identity without changing standard Present completion semantics. */
+typedef struct {
+    uint64_t tag;
+    uint32_t window;
+    uint32_t serial;
+} LoriePresentTag;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -49,6 +59,7 @@ void lorieWakeServer(void);
 void lorieRecheckGpuCopies(void);
 void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
                                 uint64_t renderer_serial, uint64_t gpu_copy_serial,
+                                LoriePresentTag present_tag,
                                 uint64_t egl_frame_id, int64_t submit_ns,
                                 int64_t present_ns);
 void lorieChoreographerStart(AChoreographer *choreographer);
@@ -194,6 +205,7 @@ typedef union {
         uint32_t surfaceGeneration;
         uint64_t rendererSerial;
         uint64_t gpuCopySerial;
+        LoriePresentTag presentTag;
         uint64_t eglFrameId;
         int64_t submitNs;
         int64_t presentNs;
@@ -213,6 +225,7 @@ typedef struct {
     uint64_t serial;
     uint64_t srcBufferId;
     uint64_t dstBufferId;
+    LoriePresentTag presentTag;
     int16_t xOff, yOff;
     uint16_t numRects;
     LorieGpuCopyRect rects[LORIE_GPU_COPY_MAX_RECTS];
@@ -239,6 +252,15 @@ struct lorie_shared_server_state {
         volatile uint64_t completedSerial;
         LorieGpuCopyEntry entries[LORIE_GPU_COPY_QUEUE_CAPACITY];
     } gpuCopyQueue;
+
+    /* DEBUG: seqlock-style publication of CPU-copy/flip Present identity.
+     * The X server is the sole writer and the renderer is the sole reader.
+     * An odd version is being written; an unchanged even version is a
+     * consistent snapshot.  GPU-copy tags travel in their queue entry. */
+    struct {
+        volatile uint32_t version;
+        LoriePresentTag value;
+    } latestPresentTag;
 
     /* ID of root window texture to be drawn. */
     uint64_t rootWindowTextureID;
@@ -304,6 +326,7 @@ struct Renderer {
         uint32_t surfaceGeneration = 0;
         uint64_t rendererSerial = 0;
         uint64_t gpuCopySerial = 0;
+        LoriePresentTag presentTag{};
         EGLuint64KHR eglFrameId = 0;
         int64_t submitNs = 0;
     };
@@ -384,6 +407,8 @@ struct Renderer {
     uint32_t presentFeedbackSurfaceGeneration = 0;
     uint32_t presentFeedbackPollSerialSeen = 0;
     uint64_t rendererPresentSerial = 0;
+    LoriePresentTag latestContentPresentTag{};
+    uint64_t lastSubmittedPresentTag = 0;
     bool presentFeedbackExtensionAvailable = false;
     bool presentFeedbackSurfaceEnabled = false;
 
@@ -420,8 +445,9 @@ struct Renderer {
     void configurePresentFeedbackSurface();
     void resetPresentFeedback(bool notifyUnknown);
     void pollPresentFeedback();
-    void recordPresentFeedback(uint64_t gpuCopySerial, int64_t submitNs,
-                               EGLuint64KHR eglFrameId);
+    void recordPresentFeedback(uint64_t gpuCopySerial,
+                               const LoriePresentTag& presentTag,
+                               int64_t submitNs, EGLuint64KHR eglFrameId);
     void notifyPresentFeedback(const PendingPresentFeedback& pending,
                                uint8_t status, int64_t presentNs) const;
     void reportViewport(int dstX, int dstY, int dstW, int dstH, float left, float top, float width, float height);
