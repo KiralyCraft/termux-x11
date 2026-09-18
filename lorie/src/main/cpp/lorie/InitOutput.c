@@ -79,6 +79,9 @@ typedef struct {
 
     Bool dri3;
     Bool gpuPresentDisabled;
+    /* DEBUG: result of the explicit consumer-owned AHB render-target probe.
+     * It never affects the normal allocation or Present path. */
+    Bool directAllocationValidated;
 
     uint64_t vblank_interval;
     struct xorg_list vblank_queue;
@@ -1013,7 +1016,8 @@ void InitOutput(ScreenInfo * screen_info, int argc, char **argv) {
     screen_info->bitmapBitOrder = BITMAP_BIT_ORDER;
     screen_info->numPixmapFormats = ARRAY_SIZE(depths);
 
-    rendererTestCapabilities(&pvfb->root.legacyDrawing, &pvfb->gpuPresentDisabled);
+    rendererTestCapabilities(&pvfb->root.legacyDrawing, &pvfb->gpuPresentDisabled,
+                             &pvfb->directAllocationValidated);
     xorgGlxCreateVendor();
     lorieInitClipboard();
 
@@ -1367,6 +1371,7 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
 
     check(num_fds > 1, "DRI3: More than 1 fd");
     check(modifier != RAW_MMAPPABLE_FD && modifier != AHARDWAREBUFFER_SOCKET_FD && modifier != AHARDWAREBUFFER_FLIPPED_SOCKET_FD &&
+          modifier != LORIE_DRI3_AHB_ALLOCATE_SOCKET_FD &&
           modifier != DRM_FORMAT_MOD_INVALID && modifier != DRM_FORMAT_MOD_LINEAR, "DRI3: Modifier is not RAW_MMAPPABLE_FD or AHARDWAREBUFFER_SOCKET_FD");
 
     pixmap = screen->CreatePixmap(screen, 0, 0, depth, 0);
@@ -1376,6 +1381,59 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
     check(!priv, "DRI3: failed to obtain pixmap private");
 
     priv->imported = true;
+
+    /* DEBUG: reverse DRI3 allocation handshake.  The client passes one end
+     * of a socketpair in place of a dma-buf.  Only an explicitly enabled and
+     * successfully validated server may allocate the AHardwareBuffer, retain
+     * it as the pixmap backing, and send its platform handle back. */
+    if (modifier == LORIE_DRI3_AHB_ALLOCATE_SOCKET_FD) {
+        const uint64_t usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
+                               AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                               AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
+                               AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+                               AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
+        LorieDri3AhbAllocationReply reply = {
+            .magic = LORIE_DRI3_AHB_ALLOCATION_MAGIC,
+            .version = LORIE_DRI3_AHB_ALLOCATION_VERSION,
+            .status = -ENOTSUP,
+        };
+        AHardwareBuffer_Desc allocation_desc = {0};
+        struct stat info;
+
+        check(!getenv("TERMUX_X11_EXPERIMENTAL_DIRECT_ALLOC") ||
+              !pvfb->directAllocationValidated,
+              "DRI3: experimental consumer-owned allocation is unavailable");
+        check(fstat(fds[0], &info) != 0 || !S_ISSOCK(info.st_mode),
+              "DRI3: consumer-owned allocation fd is not a socket");
+
+        priv->buffer = LorieBuffer_allocateAHardwareBuffer(width, height,
+                          AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, usage);
+        check(!priv->buffer, "DRI3: consumer-owned AHardwareBuffer allocation failed");
+
+        const LorieBuffer_Desc *allocated = LorieBuffer_description(priv->buffer);
+        LorieBuffer_describeAHardwareBuffer(allocated->buffer, &allocation_desc);
+        reply.status = 0;
+        reply.width = allocation_desc.width;
+        reply.height = allocation_desc.height;
+        reply.stride = allocation_desc.stride;
+        reply.format = allocation_desc.format;
+        reply.usage = allocation_desc.usage;
+        check(!LorieBuffer_writeAllToUnixSocket(fds[0], &reply, sizeof(reply)),
+              "DRI3: failed to send consumer-owned allocation description");
+        check(LorieBuffer_sendAHardwareBufferHandleToUnixSocket(
+                  allocated->buffer, fds[0]) != 0,
+              "DRI3: failed to send consumer-owned AHardwareBuffer handle");
+        shutdown(fds[0], SHUT_WR);
+
+        screen->ModifyPixmapHeader(pixmap, allocation_desc.width,
+                                   allocation_desc.height, 0, 0,
+                                   allocation_desc.stride * 4, NULL);
+        if (lorieServerDebugEnabled)
+            log(INFO, "DEBUG: allocated consumer-owned AHardwareBuffer %ux%u stride %u usage 0x%llx",
+                reply.width, reply.height, reply.stride,
+                (unsigned long long) reply.usage);
+        return pixmap;
+    }
 
     if (modifier == DRM_FORMAT_MOD_INVALID || modifier == DRM_FORMAT_MOD_LINEAR || modifier == RAW_MMAPPABLE_FD) {
         check(!(priv->buffer = LorieBuffer_wrapFileDescriptor(width, strides[0]/4, height, AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM, fds[0], offsets[0])), "DRI3: LorieBuffer_wrapAHardwareBuffer failed.");

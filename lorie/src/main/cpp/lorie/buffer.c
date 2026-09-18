@@ -215,6 +215,27 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocate(int32_t width, int32_t height,
     return allocate(width, width, height, format, type, ahardwarebuffer, fd, size, 0, true);
 }
 
+__LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocateAHardwareBuffer(int32_t width, int32_t height,
+                                                                  int8_t format, uint64_t usage) {
+    AHardwareBuffer *buffer = NULL;
+    AHardwareBuffer_Desc desc = {
+        .width = (uint32_t) width,
+        .height = (uint32_t) height,
+        .layers = 1,
+        .format = (uint32_t) format,
+        .usage = usage,
+    };
+    int err = -ENOSYS;
+
+    if (__builtin_available(android 26, *))
+        err = AHardwareBuffer_allocate(&desc, &buffer);
+    if (err != 0 || !buffer)
+        return NULL;
+
+    return allocate(width, width, height, format, LORIEBUFFER_AHARDWAREBUFFER,
+                    buffer, -1, 0, 0, true);
+}
+
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapFileDescriptor(int32_t width, int32_t stride, int32_t height, int8_t format, int fd, off_t offset) {
     return allocate(width, stride, height, format, LORIEBUFFER_FD, NULL, fd, stride * height * sizeof(uint32_t), offset, false);
 }
@@ -506,6 +527,29 @@ int LorieBuffer_recvAHardwareBufferHandleFromUnixSocket(int socketFd, AHardwareB
     if (__builtin_available(android 26, *))
         return AHardwareBuffer_recvHandleFromUnixSocket(socketFd, outBuffer);
     return -ENOSYS;
+}
+
+int LorieBuffer_sendAHardwareBufferHandleToUnixSocket(AHardwareBuffer* buffer, int socketFd) {
+    if (!buffer || socketFd < 0)
+        return -EINVAL;
+    if (__builtin_available(android 26, *))
+        return AHardwareBuffer_sendHandleToUnixSocket(buffer, socketFd);
+    return -ENOSYS;
+}
+
+bool LorieBuffer_writeAllToUnixSocket(int socketFd, const void *data, size_t size) {
+    const uint8_t *cursor = data;
+
+    while (size) {
+        ssize_t sent = send(socketFd, cursor, size, MSG_NOSIGNAL);
+        if (sent < 0 && errno == EINTR)
+            continue;
+        if (sent <= 0)
+            return false;
+        cursor += sent;
+        size -= (size_t) sent;
+    }
+    return true;
 }
 
 void LorieBuffer_describeAHardwareBuffer(AHardwareBuffer* buffer, AHardwareBuffer_Desc* outDesc) {

@@ -57,7 +57,8 @@ void lorieSendSyncReply(uint32_t serial);
 void registerCmdEntryPointNatives(JNIEnv *env);
 void lorieListenForKnocks(void);
 
-__unused void rendererTestCapabilities(int* legacy_drawing, int* gpu_present_disabled);
+__unused void rendererTestCapabilities(int* legacy_drawing, int* gpu_present_disabled,
+                                       int* direct_allocation_validated);
 
 static inline __always_inline void lorie_mutex_lock(pthread_mutex_t* mutex, pid_t* lockingPid) {
     // Unfortunately there is no robust mutexes in bionic.
@@ -342,7 +343,8 @@ struct Renderer {
     void* initThread();
     int getWakeupCondFd() const;
     void setFiltering(jint f);
-    void testCapabilities(int* legacy_drawing, int* gpu_present_disabled);
+    void testCapabilities(int* legacy_drawing, int* gpu_present_disabled,
+                          int* direct_allocation_validated);
     void setSharedState(struct lorie_shared_server_state* newState);
     void addBuffer(LorieBuffer* buf);
     void removeBuffer(uint64_t id);

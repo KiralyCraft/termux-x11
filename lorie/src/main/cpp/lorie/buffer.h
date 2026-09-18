@@ -11,6 +11,32 @@ extern "C" {
 
 #define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5 // Stands to HAL_PIXEL_FORMAT_BGRA_8888
 
+/* DEBUG: private DRI3 handshake used only by the opt-in consumer-owned
+ * render-target experiment.  This is deliberately outside the DRM modifier
+ * namespace, matching the existing private socket modifiers below. */
+#define LORIE_DRI3_AHB_ALLOCATE_SOCKET_FD 1257ULL
+#define LORIE_DRI3_AHB_ALLOCATION_MAGIC 0x4248414cU /* "LAHB", little endian */
+#define LORIE_DRI3_AHB_ALLOCATION_VERSION 1U
+
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint32_t version;
+    int32_t status;
+    uint32_t width;
+    uint32_t height;
+    uint32_t stride;
+    uint32_t format;
+    uint64_t usage;
+} LorieDri3AhbAllocationReply;
+
+#ifdef __cplusplus
+static_assert(sizeof(LorieDri3AhbAllocationReply) == 36,
+              "Mesa consumer-allocation reply layout changed");
+#else
+_Static_assert(sizeof(LorieDri3AhbAllocationReply) == 36,
+               "Mesa consumer-allocation reply layout changed");
+#endif
+
 enum {
     LORIEBUFFER_UNKNOWN __unused,
     LORIEBUFFER_REGULAR,
@@ -48,6 +74,13 @@ int LorieBuffer_createRegion(char const* _Nonnull name, size_t size);
  * @return returns the buffer itself or NULL on failure.
  */
 LorieBuffer* _Nullable LorieBuffer_allocate(int32_t width, int32_t height, int8_t format, int8_t type);
+
+/**
+ * DEBUG: Allocate an AHardwareBuffer with an explicit consumer contract.
+ * Used only by the negotiated consumer-owned render-target experiment.
+ */
+LorieBuffer* _Nullable LorieBuffer_allocateAHardwareBuffer(int32_t width, int32_t height,
+                                                            int8_t format, uint64_t usage);
 
 /**
  * Wraps given memory fragment file descriptor into LorieBuffer.
@@ -244,6 +277,15 @@ LorieBuffer* _Nullable LorieBufferList_findById(struct xorg_list* _Nullable list
  * @return 0 on success, an error code otherwise.
  */
 int LorieBuffer_recvAHardwareBufferHandleFromUnixSocket(int socketFd, AHardwareBuffer* _Nullable * _Nonnull outBuffer);
+
+/**
+ * DEBUG: Send only the platform AHardwareBuffer wire handle, without the
+ * process-private LorieBuffer wrapper which normally precedes it.
+ */
+int LorieBuffer_sendAHardwareBufferHandleToUnixSocket(AHardwareBuffer* _Nonnull buffer, int socketFd);
+
+/** DEBUG: Write a complete private-protocol record without SIGPIPE. */
+bool LorieBuffer_writeAllToUnixSocket(int socketFd, const void* _Nonnull data, size_t size);
 
 /**
  * Describes a raw AHardwareBuffer, as obtained from LorieBuffer_recvAHardwareBufferHandleFromUnixSocket.

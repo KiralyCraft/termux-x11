@@ -61,10 +61,16 @@ static bool validateDirectPresentationTarget(EGLDisplay display) {
         .width = 64,
         .height = 64,
         .layers = 1,
-        .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+        /* Mesa's XRGB8888 dma-buf layout corresponds to Android's BGRA
+         * allocation on little-endian devices.  CPU usage keeps this first
+         * experiment in the verified-linear candidate class; it is not the
+         * eventual compressed/direct allocation policy. */
+        .format = AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM,
         .usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
                  AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
-                 AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY,
+                 AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY |
+                 AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN |
+                 AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN,
     };
     AHardwareBuffer_Desc actual = {};
     AHardwareBuffer *buffer = nullptr;
@@ -451,7 +457,8 @@ void Renderer::setFiltering(jint f) {
     filtering = f;
 }
 
-void Renderer::testCapabilities(int* legacy_drawing, int* gpu_present_disabled) {
+void Renderer::testCapabilities(int* legacy_drawing, int* gpu_present_disabled,
+                                int* direct_allocation_validated) {
     // Some devices do not support sampling from HAL_PIXEL_FORMAT_BGRA_8888, here we are checking it.
     const EGLint imageAttributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
     EGLint numConfigs;
@@ -625,8 +632,10 @@ void Renderer::testCapabilities(int* legacy_drawing, int* gpu_present_disabled) 
         /* DEBUG: Explicitly requested research probe.  It is intentionally
          * validation-only: no capability is exposed and no presentation path
          * changes even when it passes. */
-        if (getenv("TERMUX_X11_EXPERIMENTAL_DIRECT_VALIDATE"))
-            validateDirectPresentationTarget(egl_display);
+        if (getenv("TERMUX_X11_EXPERIMENTAL_DIRECT_VALIDATE") ||
+            getenv("TERMUX_X11_EXPERIMENTAL_DIRECT_ALLOC"))
+            *direct_allocation_validated =
+                validateDirectPresentationTarget(egl_display);
         eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroyContext(egl_display, testctx);
         eglDestroyImageKHR(egl_display, img);
@@ -635,9 +644,11 @@ void Renderer::testCapabilities(int* legacy_drawing, int* gpu_present_disabled) 
     }
 }
 
-void rendererTestCapabilities(int* legacy_drawing, int* gpu_present_disabled) {
+void rendererTestCapabilities(int* legacy_drawing, int* gpu_present_disabled,
+                              int* direct_allocation_validated) {
     Renderer scratch;
-    scratch.testCapabilities(legacy_drawing, gpu_present_disabled);
+    scratch.testCapabilities(legacy_drawing, gpu_present_disabled,
+                             direct_allocation_validated);
 }
 
 void Renderer::setSharedState(struct lorie_shared_server_state* newState) {
