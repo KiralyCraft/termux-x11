@@ -612,7 +612,15 @@ static Bool lorieCreateScreenResources(ScreenPtr pScreen) {
         FatalError("Couldn't setup damage\n");
 
     DamageRegister(&(*pScreen->GetScreenPixmap)(pScreen)->drawable, pvfb->damage);
-    pvfb->fpsTimer = TimerSet(NULL, 0, 5000, lorieFramecounter, pScreen);
+    /* The periodic statistics callback runs on the X server thread.  Keep it
+     * out of the normal presentation path; it is diagnostic-only and can be
+     * enabled together with the rest of the server's debug logging. */
+    if (pvfb->fpsTimer) {
+        TimerFree(pvfb->fpsTimer);
+        pvfb->fpsTimer = NULL;
+    }
+    if (lorieServerDebugEnabled)
+        pvfb->fpsTimer = TimerSet(NULL, 0, 5000, lorieFramecounter, pScreen);
 
     lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
 
@@ -620,6 +628,10 @@ static Bool lorieCreateScreenResources(ScreenPtr pScreen) {
 }
 
 static Bool lorieCloseScreen(ScreenPtr pScreen) {
+    if (pvfb->fpsTimer) {
+        TimerFree(pvfb->fpsTimer);
+        pvfb->fpsTimer = NULL;
+    }
     pScreenPtr = NULL;
     pScreen->DestroyPixmap(pScreen->devPrivate);
     pScreen->devPrivate = NULL;
