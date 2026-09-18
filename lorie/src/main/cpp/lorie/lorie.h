@@ -18,6 +18,15 @@
 #define PORT 7892
 #define MAGIC "0xDEADBEEF"
 
+/* Private Present capability bits shared with the matching Mesa loader.
+ * Standard Present capabilities currently occupy the low bits.  These bits
+ * describe Termux:X11 implementation details; clients which do not know them
+ * simply ignore them.
+ */
+#define LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE (1u << 29)
+#define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
+#define LORIE_PRESENT_CAP_FRAME_TIMELINE          (1u << 31)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -35,7 +44,7 @@ void lorieSetStylusEnabled(Bool enabled);
 void lorieSyncLockKeysState(uint8_t state);
 void lorieWakeServer(void);
 void lorieRecheckGpuCopies(void);
-void lorieChoreographerFrameCallback(__unused long t, AChoreographer* d);
+void lorieChoreographerStart(AChoreographer *choreographer);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
 void lorieRegisterBuffer(LorieBuffer* buffer);

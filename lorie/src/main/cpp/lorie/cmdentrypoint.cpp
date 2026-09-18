@@ -211,7 +211,7 @@ static jboolean start(JNIEnv *env, jobject self, jobjectArray args) {
 
     AChoreographer *choreographer = AChoreographer_getInstance();
     // Trigger it first time
-    AChoreographer_postFrameCallback(choreographer, (AChoreographer_frameCallback) lorieChoreographerFrameCallback, choreographer);
+    lorieChoreographerStart(choreographer);
 
     xorg_list_init(&registeredBuffers);
     pthread_create(&t, nullptr, +[](void* cookie) -> void* {
