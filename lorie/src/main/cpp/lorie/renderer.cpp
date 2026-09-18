@@ -348,6 +348,24 @@ void Renderer::notifyPresentFeedback(const PendingPresentFeedback& pending,
     write(*connFdPtr, &event, sizeof(event));
 }
 
+void Renderer::retirePresentTagUnknown(const LoriePresentTag& presentTag,
+                                       uint64_t gpuCopySerial) {
+    PendingPresentFeedback pending{};
+
+    if (!presentTag.tag || presentTag.tag <= lastSubmittedPresentTag)
+        return;
+
+    if (presentTag.feedbackEid) {
+        pending.valid = true;
+        pending.surfaceGeneration = presentFeedbackSurfaceGeneration;
+        pending.rendererSerial = ++rendererPresentSerial;
+        pending.gpuCopySerial = gpuCopySerial;
+        pending.presentTag = presentTag;
+        notifyPresentFeedback(pending, LORIE_PRESENT_FEEDBACK_UNKNOWN, 0);
+    }
+    lastSubmittedPresentTag = presentTag.tag;
+}
+
 void Renderer::resetPresentFeedback(bool notifyUnknown) {
     while (presentFeedbackRead != presentFeedbackWrite) {
         PendingPresentFeedback& pending =
@@ -366,15 +384,30 @@ void Renderer::resetPresentFeedback(bool notifyUnknown) {
 void Renderer::configurePresentFeedbackSurface() {
     EGLBoolean supported;
     LoriePresentTag current{};
+    bool retireCurrent = false;
 
     resetPresentFeedback(true);
     presentFeedbackSurfaceGeneration++;
     latestContentPresentTag = {};
-    if (readPublishedPresentTag(state, &current))
-        latestContentPresentTag = current;
+    if (state) {
+        lorie_mutex_lock(&state->lock, &state->lockingPid);
+        if (readPublishedPresentTag(state, &current)) {
+            latestContentPresentTag = current;
+            if (__atomic_load_n(&state->latestPresentTag.claimedTag,
+                                __ATOMIC_ACQUIRE) != current.tag) {
+                __atomic_store_n(&state->latestPresentTag.claimedTag,
+                                 current.tag, __ATOMIC_RELEASE);
+                retireCurrent = true;
+            }
+        }
+        lorie_mutex_unlock(&state->lock, &state->lockingPid);
+    }
     /* Content which predates this Android surface is not attributed to a new
      * application frame merely because the surface needs its initial redraw. */
-    lastSubmittedPresentTag = latestContentPresentTag.tag;
+    if (retireCurrent)
+        retirePresentTagUnknown(current);
+    if (latestContentPresentTag.tag > lastSubmittedPresentTag)
+        lastSubmittedPresentTag = latestContentPresentTag.tag;
     presentFeedbackPollSerialSeen = state
         ? __atomic_load_n(&state->presentFeedbackPollSerial, __ATOMIC_ACQUIRE)
         : 0;
@@ -1220,8 +1253,14 @@ uint64_t Renderer::applyPendingGpuCopiesLocked() {
             /* The GPU copy is part of this renderer submission.  Preserve the
              * newest root-visible Present identity across a standalone queue
              * drain so the subsequent Android redraw can still claim it. */
-            if (entry.presentTag.tag > latestContentPresentTag.tag)
+            if (entry.presentTag.tag > latestContentPresentTag.tag) {
+                uint64_t claimedCpuTag = state ?
+                    __atomic_load_n(&state->latestPresentTag.claimedTag,
+                                    __ATOMIC_ACQUIRE) : 0;
+                if (latestContentPresentTag.tag != claimedCpuTag)
+                    retirePresentTagUnknown(latestContentPresentTag);
                 latestContentPresentTag = entry.presentTag;
+            }
         }
 
         lastSerial = entry.serial;
@@ -1398,9 +1437,26 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     // Share this draw's flush+fence below instead of a separate round trip per frame.
     uint64_t gpuCopySerial = applyPendingGpuCopiesLocked();
     LoriePresentTag publishedPresentTag{};
-    if (readPublishedPresentTag(state, &publishedPresentTag) &&
-        publishedPresentTag.tag > latestContentPresentTag.tag)
-        latestContentPresentTag = publishedPresentTag;
+    if (readPublishedPresentTag(state, &publishedPresentTag)) {
+        uint64_t claimedCpuTag = __atomic_load_n(
+            &state->latestPresentTag.claimedTag, __ATOMIC_ACQUIRE);
+
+        if (claimedCpuTag != publishedPresentTag.tag) {
+            if (publishedPresentTag.tag > latestContentPresentTag.tag) {
+                if (latestContentPresentTag.tag != claimedCpuTag)
+                    retirePresentTagUnknown(latestContentPresentTag);
+                latestContentPresentTag = publishedPresentTag;
+            } else if (publishedPresentTag.tag <
+                       latestContentPresentTag.tag) {
+                retirePresentTagUnknown(publishedPresentTag);
+            }
+            __atomic_store_n(&state->latestPresentTag.claimedTag,
+                             publishedPresentTag.tag, __ATOMIC_RELEASE);
+        } else if (publishedPresentTag.tag >
+                   latestContentPresentTag.tag) {
+            latestContentPresentTag = publishedPresentTag;
+        }
+    }
     LoriePresentTag framePresentTag{};
     if (latestContentPresentTag.tag > lastSubmittedPresentTag)
         framePresentTag = latestContentPresentTag;
@@ -1445,14 +1501,17 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
         getNextFrameIdANDROID(egl_display, sfc, &eglFrameId) == EGL_TRUE;
     int64_t submitNs = trackPresent ? monotonicTimeNs() : 0;
 
-    if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
+    if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE) {
         printEglError("Failed to swap buffers", __LINE__);
-    else {
-        if (framePresentTag.tag)
+        retirePresentTagUnknown(framePresentTag, gpuCopySerial);
+    } else {
+        if (framePresentTag.tag && trackPresent)
             lastSubmittedPresentTag = framePresentTag.tag;
         if (trackPresent)
             recordPresentFeedback(gpuCopySerial, framePresentTag, submitNs,
                                   eglFrameId);
+        else
+            retirePresentTagUnknown(framePresentTag, gpuCopySerial);
     }
 
     // Perform a little drawing operation to make sure the next buffer is ready on the next invocation of drawing

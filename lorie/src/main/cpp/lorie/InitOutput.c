@@ -1224,16 +1224,33 @@ uint64_t loriePreparePresentTag(WindowPtr window, PixmapPtr dst) {
 }
 
 /* DEBUG: Publish CPU-copy/flip identity after its root contents are ready to
- * be sampled.  The renderer uses the version as a seqlock and never treats
- * this timing metadata as producer completion or storage release. */
+ * be sampled.  Replacing an identity which the renderer has not claimed means
+ * that content was superseded before Android submission, so retire it as
+ * timing-unknown immediately instead of leaving the client to time it out.
+ * The existing root-buffer lock makes the claim/replacement decision atomic
+ * with respect to renderer sampling.  This timing metadata is never treated
+ * as producer completion or storage release. */
 void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial,
                             uint32_t feedback_eid,
                             uint64_t window_generation,
                             uint64_t event_generation) {
+    LoriePresentTag previous;
+    uint64_t claimed_tag;
     uint32_t version;
 
     if (!tag || !pvfb->state)
         return;
+    lorie_mutex_lock(&pvfb->state->lock, &pvfb->state->lockingPid);
+    previous = pvfb->state->latestPresentTag.value;
+    claimed_tag = __atomic_load_n(&pvfb->state->latestPresentTag.claimedTag,
+                                  __ATOMIC_ACQUIRE);
+    if (previous.tag && previous.feedbackEid &&
+        claimed_tag != previous.tag) {
+        __atomic_store_n(&pvfb->state->latestPresentTag.claimedTag,
+                         previous.tag, __ATOMIC_RELEASE);
+        lorieHandlePresentFeedback(LORIE_PRESENT_FEEDBACK_UNKNOWN, 0, 0, 0,
+                                   previous, 0, 0, 0);
+    }
     version = __atomic_load_n(&pvfb->state->latestPresentTag.version,
                               __ATOMIC_RELAXED);
     if (version & 1)
@@ -1256,6 +1273,7 @@ void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial,
                      __ATOMIC_RELAXED);
     __atomic_store_n(&pvfb->state->latestPresentTag.version, version + 2,
                      __ATOMIC_RELEASE);
+    lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
 }
 
 // Tries to offload a Present "copy" operation (present_execute_copy) to the renderer's GPU

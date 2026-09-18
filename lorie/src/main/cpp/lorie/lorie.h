@@ -270,9 +270,14 @@ struct lorie_shared_server_state {
     /* DEBUG: seqlock-style publication of CPU-copy/flip Present identity.
      * The X server is the sole writer and the renderer is the sole reader.
      * An odd version is being written; an unchanged even version is a
-     * consistent snapshot.  GPU-copy tags travel in their queue entry. */
+     * consistent snapshot.  claimedTag identifies the exact slot value the
+     * renderer has either attached to a submission or explicitly retired.
+     * Both sides update it while holding the root-buffer lock, so replacing
+     * an unclaimed value can be retired as timing-unknown without racing a
+     * renderer submission.  GPU-copy tags travel in their queue entry. */
     struct {
         volatile uint32_t version;
+        volatile uint64_t claimedTag;
         LoriePresentTag value;
     } latestPresentTag;
 
@@ -459,6 +464,8 @@ struct Renderer {
     void configurePresentFeedbackSurface();
     void resetPresentFeedback(bool notifyUnknown);
     void pollPresentFeedback();
+    void retirePresentTagUnknown(const LoriePresentTag& presentTag,
+                                 uint64_t gpuCopySerial = 0);
     void recordPresentFeedback(uint64_t gpuCopySerial,
                                const LoriePresentTag& presentTag,
                                int64_t submitNs, EGLuint64KHR eglFrameId);
