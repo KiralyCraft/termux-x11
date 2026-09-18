@@ -437,19 +437,31 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 }, nullptr, nullptr);
                 lorieWakeServer();
                 break;
-            case EVENT_PRESENT_FEEDBACK:
-                /* DEBUG: statistics-only. This runs on the socket input thread
-                 * and only updates atomic counters; it must not complete an X
-                 * Present request or release storage. */
-                lorieHandlePresentFeedback(e.presentFeedback.status,
-                                           e.presentFeedback.surfaceGeneration,
-                                           e.presentFeedback.rendererSerial,
-                                           e.presentFeedback.gpuCopySerial,
-                                           e.presentFeedback.presentTag,
-                                           e.presentFeedback.eglFrameId,
-                                           e.presentFeedback.submitNs,
-                                           e.presentFeedback.presentNs);
+            case EVENT_PRESENT_FEEDBACK: {
+                auto *copy = static_cast<lorieEvent*>(calloc(1, sizeof(lorieEvent)));
+                if (!copy)
+                    break;
+                *copy = e;
+                QueueWorkProc(+[](__unused ClientPtr pClient, void *closure) -> Bool {
+                    /* Client event routing and X resource generation checks
+                     * must run on the X server thread.  This feedback remains
+                     * timing-only: it never signals a producer fence or frees
+                     * consumer-owned storage. */
+                    auto *event = static_cast<lorieEvent*>(closure);
+                    lorieHandlePresentFeedback(event->presentFeedback.status,
+                                               event->presentFeedback.surfaceGeneration,
+                                               event->presentFeedback.rendererSerial,
+                                               event->presentFeedback.gpuCopySerial,
+                                               event->presentFeedback.presentTag,
+                                               event->presentFeedback.eglFrameId,
+                                               event->presentFeedback.submitNs,
+                                               event->presentFeedback.presentNs);
+                    free(event);
+                    return TRUE;
+                }, nullptr, copy);
+                lorieWakeServer();
                 break;
+            }
             case EVENT_SYNC: {
                 auto serial = (uintptr_t) e.sync.serial;
                 QueueWorkProc(+[](__unused ClientPtr pClient, void *closure) -> Bool {

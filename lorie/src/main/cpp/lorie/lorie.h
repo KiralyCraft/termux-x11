@@ -23,9 +23,17 @@
  * describe Termux:X11 implementation details; clients which do not know them
  * simply ignore them.
  */
+#define LORIE_PRESENT_CAP_ACTUAL_FEEDBACK         (1u << 28)
 #define LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE (1u << 29)
 #define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
 #define LORIE_PRESENT_CAP_FRAME_TIMELINE          (1u << 31)
+
+/* Per-request opt-in.  The matching Mesa loader only sets this after the
+ * capability above was advertised, so unmodified servers never see it. */
+#define LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK      (1u << 31)
+#define LORIE_PRESENT_COMPLETE_KIND_ACTUAL        2
+#define LORIE_PRESENT_COMPLETE_MODE_ACTUAL        1
+#define LORIE_PRESENT_COMPLETE_MODE_UNKNOWN       2
 
 #define LORIE_PRESENT_FEEDBACK_PRESENTED 1
 #define LORIE_PRESENT_FEEDBACK_UNKNOWN   2
@@ -33,11 +41,17 @@
 /* DEBUG: Identity of the newest X Present whose contents were incorporated
  * into an Android renderer frame.  tag is server-monotonic and is the
  * publication/correlation key; window and serial retain the originating
- * Present identity without changing standard Present completion semantics. */
+ * Present identity without changing standard Present completion semantics.
+ * The event and window generation cookies prevent delayed renderer feedback
+ * from being delivered to a resource which reused the same XID. */
 typedef struct __attribute__((aligned(8))) {
     uint64_t tag;
+    uint64_t windowGeneration;
+    uint64_t eventGeneration;
     uint32_t window;
     uint32_t serial;
+    uint32_t feedbackEid;
+    uint32_t reserved;
 } LoriePresentTag;
 
 #ifdef __cplusplus

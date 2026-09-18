@@ -88,10 +88,22 @@ static bool readPublishedPresentTag(const lorie_shared_server_state* state,
             continue;
         out->tag = __atomic_load_n(&state->latestPresentTag.value.tag,
                                    __ATOMIC_RELAXED);
+        out->windowGeneration = __atomic_load_n(
+            &state->latestPresentTag.value.windowGeneration,
+            __ATOMIC_RELAXED);
+        out->eventGeneration = __atomic_load_n(
+            &state->latestPresentTag.value.eventGeneration,
+            __ATOMIC_RELAXED);
         out->window = __atomic_load_n(&state->latestPresentTag.value.window,
                                       __ATOMIC_RELAXED);
         out->serial = __atomic_load_n(&state->latestPresentTag.value.serial,
                                       __ATOMIC_RELAXED);
+        out->feedbackEid = __atomic_load_n(
+            &state->latestPresentTag.value.feedbackEid,
+            __ATOMIC_RELAXED);
+        out->reserved = __atomic_load_n(
+            &state->latestPresentTag.value.reserved,
+            __ATOMIC_RELAXED);
         after = __atomic_load_n(&state->latestPresentTag.version,
                                 __ATOMIC_ACQUIRE);
         if (before == after && !(after & 1))

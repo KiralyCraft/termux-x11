@@ -103,7 +103,8 @@ typedef struct {
     uint64_t presentTagCounter;
 
     /* DEBUG: aggregate actual Android display feedback without changing X
-     * Present completion semantics. Updated from the socket input thread. */
+     * Present completion semantics. Updated from an X-server-thread work
+     * item so opted-in client events can be delivered safely. */
     pthread_mutex_t presentFeedbackLock;
     uint64_t presentFeedbackPresented;
     uint64_t presentFeedbackUnknown;
@@ -645,11 +646,13 @@ void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
         pthread_mutex_unlock(&pvfb->presentFeedbackLock);
 
         if (loriePresentFeedbackVerbose)
-            log(INFO, "DEBUG: present feedback generation=%u renderer=%llu copy=%llu tag=%llu window=0x%x serial=%u egl=%llu submit=%lld present=%lld latency=%.3fms",
+            log(INFO, "DEBUG: present feedback generation=%u renderer=%llu copy=%llu tag=%llu window=0x%x serial=%u eid=0x%x window-generation=%llu event-generation=%llu egl=%llu submit=%lld present=%lld latency=%.3fms",
                 surface_generation, (unsigned long long) renderer_serial,
                 (unsigned long long) gpu_copy_serial,
                 (unsigned long long) present_tag.tag, present_tag.window,
-                present_tag.serial,
+                present_tag.serial, present_tag.feedbackEid,
+                (unsigned long long) present_tag.windowGeneration,
+                (unsigned long long) present_tag.eventGeneration,
                 (unsigned long long) egl_frame_id, (long long) submit_ns,
                 (long long) present_ns, (double) latency / 1000000.0);
     } else {
@@ -657,12 +660,35 @@ void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
         pvfb->presentFeedbackUnknown++;
         pthread_mutex_unlock(&pvfb->presentFeedbackLock);
         if (loriePresentFeedbackVerbose)
-            log(INFO, "DEBUG: present feedback unknown generation=%u renderer=%llu copy=%llu tag=%llu window=0x%x serial=%u egl=%llu submit=%lld",
+            log(INFO, "DEBUG: present feedback unknown generation=%u renderer=%llu copy=%llu tag=%llu window=0x%x serial=%u eid=0x%x window-generation=%llu event-generation=%llu egl=%llu submit=%lld",
                 surface_generation, (unsigned long long) renderer_serial,
                 (unsigned long long) gpu_copy_serial,
                 (unsigned long long) present_tag.tag, present_tag.window,
-                present_tag.serial,
+                present_tag.serial, present_tag.feedbackEid,
+                (unsigned long long) present_tag.windowGeneration,
+                (unsigned long long) present_tag.eventGeneration,
                 (unsigned long long) egl_frame_id, (long long) submit_ns);
+    }
+
+    if (present_tag.feedbackEid && present_tag.window) {
+        WindowPtr window = NULL;
+        present_lorie_feedback_target_rec target = {
+            .eid = present_tag.feedbackEid,
+            .window_generation = present_tag.windowGeneration,
+            .event_generation = present_tag.eventGeneration,
+        };
+        CARD8 mode = status == LORIE_PRESENT_FEEDBACK_PRESENTED &&
+                     present_ns > 0 ?
+            LoriePresentCompleteModeActual :
+            LoriePresentCompleteModeUnknown;
+        uint64_t ust = mode == LoriePresentCompleteModeActual ?
+            (uint64_t) present_ns / 1000 : 0;
+
+        if (dixLookupWindow(&window, present_tag.window, serverClient,
+                            DixReadAccess) == Success)
+            present_lorie_send_actual_notify(window, &target, mode,
+                                             present_tag.serial, ust,
+                                             present_tag.tag);
     }
 }
 
@@ -1028,6 +1054,8 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
                                     LORIE_PRESENT_CAP_VBLANK_COMPLETE;
     if (lorieChoreographerApi.available)
         loriePresentInfo.capabilities |= LORIE_PRESENT_CAP_FRAME_TIMELINE;
+    if (pvfb->state->presentFeedbackEnabled)
+        loriePresentInfo.capabilities |= LORIE_PRESENT_CAP_ACTUAL_FEEDBACK;
 
     miSetZeroLineBias(pScreen, 0);
     pScreen->blackPixel = 0;
@@ -1198,7 +1226,10 @@ uint64_t loriePreparePresentTag(WindowPtr window, PixmapPtr dst) {
 /* DEBUG: Publish CPU-copy/flip identity after its root contents are ready to
  * be sampled.  The renderer uses the version as a seqlock and never treats
  * this timing metadata as producer completion or storage release. */
-void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial) {
+void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial,
+                            uint32_t feedback_eid,
+                            uint64_t window_generation,
+                            uint64_t event_generation) {
     uint32_t version;
 
     if (!tag || !pvfb->state)
@@ -1211,9 +1242,17 @@ void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial) {
                      __ATOMIC_RELEASE);
     __atomic_store_n(&pvfb->state->latestPresentTag.value.tag, tag,
                      __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->latestPresentTag.value.windowGeneration,
+                     window_generation, __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->latestPresentTag.value.eventGeneration,
+                     event_generation, __ATOMIC_RELAXED);
     __atomic_store_n(&pvfb->state->latestPresentTag.value.window, window,
                      __ATOMIC_RELAXED);
     __atomic_store_n(&pvfb->state->latestPresentTag.value.serial, serial,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->latestPresentTag.value.feedbackEid,
+                     feedback_eid, __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->latestPresentTag.value.reserved, 0,
                      __ATOMIC_RELAXED);
     __atomic_store_n(&pvfb->state->latestPresentTag.version, version + 2,
                      __ATOMIC_RELEASE);
@@ -1226,7 +1265,9 @@ void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial) {
 // GPU-sampleable, or the deferred copy queue is currently full.
 Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
                               uint64_t present_tag, uint32_t present_window,
-                              uint32_t present_serial,
+                              uint32_t present_serial, uint32_t feedback_eid,
+                              uint64_t window_generation,
+                              uint64_t event_generation,
                               uint64_t *out_serial, void **out_dst_buffer) {
     LorieBuffer *srcBuffer, *dstBuffer;
     LoriePixmapPriv *priv;
@@ -1318,8 +1359,11 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
     entry->dstBufferId = dstDesc->id;
     entry->presentTag = (LoriePresentTag) {
         .tag = present_tag,
+        .windowGeneration = window_generation,
+        .eventGeneration = event_generation,
         .window = present_window,
         .serial = present_serial,
+        .feedbackEid = feedback_eid,
     };
     entry->xOff = x_off;
     entry->yOff = y_off;
