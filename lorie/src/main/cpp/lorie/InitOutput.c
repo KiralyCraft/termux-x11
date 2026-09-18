@@ -100,6 +100,14 @@ typedef struct {
 
     uint64_t gpuCopySerialCounter;
     uint64_t rootGpuCopyPending;
+
+    /* DEBUG: aggregate actual Android display feedback without changing X
+     * Present completion semantics. Updated from the socket input thread. */
+    pthread_mutex_t presentFeedbackLock;
+    uint64_t presentFeedbackPresented;
+    uint64_t presentFeedbackUnknown;
+    uint64_t presentFeedbackLatencyTotalNs;
+    uint64_t presentFeedbackLatencyMaxNs;
 } lorieScreenInfo;
 
 ScreenPtr pScreenPtr;
@@ -112,6 +120,7 @@ static lorieScreenInfo lorieScreen = {
         .dri3 = TRUE,
         .vblank_queue = { &lorieScreen.vblank_queue, &lorieScreen.vblank_queue },
         .vblank_lock = PTHREAD_MUTEX_INITIALIZER,
+        .presentFeedbackLock = PTHREAD_MUTEX_INITIALIZER,
 }, *pvfb = &lorieScreen;
 static char *xstartup = NULL;
 static char **xstartupArgv = NULL;
@@ -167,6 +176,7 @@ static LorieBuffer *lorieEnsureGpuSampleable(PixmapPtr pixmap, int8_t type) {
 }
 
 static Bool lorieServerDebugEnabled = FALSE;
+static Bool loriePresentFeedbackVerbose = FALSE;
 
 void OsVendorInit(void) {
     pthread_mutexattr_t mutex_attr;
@@ -175,6 +185,8 @@ void OsVendorInit(void) {
         return;
 
     lorieServerDebugEnabled = getenv("TERMUX_X11_DEBUG") != NULL;
+    loriePresentFeedbackVerbose =
+        getenv("TERMUX_X11_EXPERIMENTAL_PRESENT_FEEDBACK_VERBOSE") != NULL;
 
     if (-1 == (lorieScreen.stateFd = LorieBuffer_createRegion("xserver", sizeof(*lorieScreen.state)))) {
         dprintf(2, "FATAL: Failed to allocate server state.\n");
@@ -192,6 +204,13 @@ void OsVendorInit(void) {
     pthread_mutex_init(&lorieScreen.state->lock, &mutex_attr);
     pthread_mutex_init(&lorieScreen.state->cursor.lock, &mutex_attr);
     lorieScreen.state->cursor.visible = TRUE;
+    /* DEBUG: opt-in only. The activity renderer learns the server-side choice
+     * through shared state, so it does not rely on Android app-process env. */
+    {
+        const char *enabled = getenv("TERMUX_X11_EXPERIMENTAL_PRESENT_FEEDBACK");
+        lorieScreen.state->presentFeedbackEnabled =
+            enabled && strcmp(enabled, "0") != 0;
+    }
 
     lorieListenForKnocks();
 }
@@ -554,6 +573,12 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
 
     pvfb->state->waitForNextFrame = false;
 
+    if (__atomic_load_n(&pvfb->state->presentFeedbackPending, __ATOMIC_ACQUIRE)) {
+        __atomic_fetch_add(&pvfb->state->presentFeedbackPollSerial, 1,
+                           __ATOMIC_RELEASE);
+        pthread_cond_signal(rendererCond);
+    }
+
     if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
         return TRUE;
 
@@ -596,12 +621,63 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
 
 static uint64_t gpuCopyAttempts = 0, gpuCopyOffloads = 0;
 
+void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
+                                uint64_t renderer_serial, uint64_t gpu_copy_serial,
+                                uint64_t egl_frame_id, int64_t submit_ns,
+                                int64_t present_ns) {
+    if (status == LORIE_PRESENT_FEEDBACK_PRESENTED && present_ns > submit_ns &&
+        submit_ns > 0) {
+        uint64_t latency = (uint64_t) (present_ns - submit_ns);
+
+        pthread_mutex_lock(&pvfb->presentFeedbackLock);
+        pvfb->presentFeedbackPresented++;
+        pvfb->presentFeedbackLatencyTotalNs += latency;
+        if (latency > pvfb->presentFeedbackLatencyMaxNs)
+            pvfb->presentFeedbackLatencyMaxNs = latency;
+        pthread_mutex_unlock(&pvfb->presentFeedbackLock);
+
+        if (loriePresentFeedbackVerbose)
+            log(INFO, "DEBUG: present feedback generation=%u renderer=%llu copy=%llu egl=%llu submit=%lld present=%lld latency=%.3fms",
+                surface_generation, (unsigned long long) renderer_serial,
+                (unsigned long long) gpu_copy_serial,
+                (unsigned long long) egl_frame_id, (long long) submit_ns,
+                (long long) present_ns, (double) latency / 1000000.0);
+    } else {
+        pthread_mutex_lock(&pvfb->presentFeedbackLock);
+        pvfb->presentFeedbackUnknown++;
+        pthread_mutex_unlock(&pvfb->presentFeedbackLock);
+        if (loriePresentFeedbackVerbose)
+            log(INFO, "DEBUG: present feedback unknown generation=%u renderer=%llu copy=%llu egl=%llu submit=%lld",
+                surface_generation, (unsigned long long) renderer_serial,
+                (unsigned long long) gpu_copy_serial,
+                (unsigned long long) egl_frame_id, (long long) submit_ns);
+    }
+}
+
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
+    uint64_t actual, unknown, totalNs, maxNs;
+
+    pthread_mutex_lock(&pvfb->presentFeedbackLock);
+    actual = pvfb->presentFeedbackPresented;
+    unknown = pvfb->presentFeedbackUnknown;
+    totalNs = pvfb->presentFeedbackLatencyTotalNs;
+    maxNs = pvfb->presentFeedbackLatencyMaxNs;
+    pvfb->presentFeedbackPresented = 0;
+    pvfb->presentFeedbackUnknown = 0;
+    pvfb->presentFeedbackLatencyTotalNs = 0;
+    pvfb->presentFeedbackLatencyMaxNs = 0;
+    pthread_mutex_unlock(&pvfb->presentFeedbackLock);
+
     if (pvfb->state->renderedFrames || gpuCopyAttempts)
         log(INFO, gpuCopyAttempts ? "%d frames in 5.0 seconds = %.1f FPS, %llu/%llu present copies offloaded to GPU"
                                    : "%d frames in 5.0 seconds = %.1f FPS",
             pvfb->state->renderedFrames, ((float) pvfb->state->renderedFrames) / 5,
             (unsigned long long) gpuCopyOffloads, (unsigned long long) gpuCopyAttempts);
+    if (actual || unknown)
+        log(INFO, "DEBUG: Android presentation feedback: %llu actual, %llu unknown, mean %.3fms, max %.3fms",
+            (unsigned long long) actual, (unsigned long long) unknown,
+            actual ? (double) totalNs / (double) actual / 1000000.0 : 0.0,
+            (double) maxNs / 1000000.0);
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
     return 5000;

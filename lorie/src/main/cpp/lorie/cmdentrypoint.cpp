@@ -437,6 +437,18 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 }, nullptr, nullptr);
                 lorieWakeServer();
                 break;
+            case EVENT_PRESENT_FEEDBACK:
+                /* DEBUG: statistics-only. This runs on the socket input thread
+                 * and only updates atomic counters; it must not complete an X
+                 * Present request or release storage. */
+                lorieHandlePresentFeedback(e.presentFeedback.status,
+                                           e.presentFeedback.surfaceGeneration,
+                                           e.presentFeedback.rendererSerial,
+                                           e.presentFeedback.gpuCopySerial,
+                                           e.presentFeedback.eglFrameId,
+                                           e.presentFeedback.submitNs,
+                                           e.presentFeedback.presentNs);
+                break;
             case EVENT_SYNC: {
                 auto serial = (uintptr_t) e.sync.serial;
                 QueueWorkProc(+[](__unused ClientPtr pClient, void *closure) -> Bool {

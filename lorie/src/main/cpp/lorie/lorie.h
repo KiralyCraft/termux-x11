@@ -27,6 +27,9 @@
 #define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
 #define LORIE_PRESENT_CAP_FRAME_TIMELINE          (1u << 31)
 
+#define LORIE_PRESENT_FEEDBACK_PRESENTED 1
+#define LORIE_PRESENT_FEEDBACK_UNKNOWN   2
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -44,6 +47,10 @@ void lorieSetStylusEnabled(Bool enabled);
 void lorieSyncLockKeysState(uint8_t state);
 void lorieWakeServer(void);
 void lorieRecheckGpuCopies(void);
+void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
+                                uint64_t renderer_serial, uint64_t gpu_copy_serial,
+                                uint64_t egl_frame_id, int64_t submit_ns,
+                                int64_t present_ns);
 void lorieChoreographerStart(AChoreographer *choreographer);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
@@ -121,6 +128,7 @@ typedef enum {
     EVENT_WINDOW_FOCUS_CHANGED,
     EVENT_RENDERER_WAKEUP_COND,
     EVENT_GPU_COPY_DONE,
+    EVENT_PRESENT_FEEDBACK,
     EVENT_LOCK_KEYS_STATE,
     EVENT_SYNC,
     EVENT_SYNC_REPLY,
@@ -179,6 +187,17 @@ typedef union {
         uint8_t t;
         uint8_t state; // bit0 = Caps Lock, bit1 = Num Lock, bit2 = Scroll Lock
     } lockKeysState;
+    struct {
+        uint8_t t;
+        uint8_t status;
+        uint16_t reserved;
+        uint32_t surfaceGeneration;
+        uint64_t rendererSerial;
+        uint64_t gpuCopySerial;
+        uint64_t eglFrameId;
+        int64_t submitNs;
+        int64_t presentNs;
+    } presentFeedback;
     struct {
         uint8_t t;
         uint32_t serial;
@@ -249,6 +268,12 @@ struct lorie_shared_server_state {
     /* Needed to show FPS counter in logcat */
     volatile int renderedFrames;
 
+    /* DEBUG: presentation-timestamp collection is explicitly enabled by the
+     * X server and only keeps the renderer awake while records are pending. */
+    volatile uint8_t presentFeedbackEnabled;
+    volatile uint8_t presentFeedbackPending;
+    volatile uint32_t presentFeedbackPollSerial;
+
     struct {
         // We should not allow updating cursor content the same time renderer draws it.
         // locking the mutex protecting the root window can cause waiting for the frame to be drawn which is unacceptable
@@ -267,10 +292,22 @@ struct lorie_shared_server_state {
 
 #ifdef __cplusplus
 #include <EGL/egl.h>
+#include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include "list.h"
 
 struct Renderer {
+    static constexpr uint32_t PRESENT_FEEDBACK_QUEUE_CAPACITY = 32;
+
+    struct PendingPresentFeedback {
+        bool valid = false;
+        uint32_t surfaceGeneration = 0;
+        uint64_t rendererSerial = 0;
+        uint64_t gpuCopySerial = 0;
+        EGLuint64KHR eglFrameId = 0;
+        int64_t submitNs = 0;
+    };
+
     EGLDisplay egl_display = EGL_NO_DISPLAY;
     EGLContext ctx = EGL_NO_CONTEXT;
     EGLSurface defaultSfc = EGL_NO_SURFACE, sfc = EGL_NO_SURFACE;
@@ -336,6 +373,20 @@ struct Renderer {
     uint64_t dstSizeLogCount = 0, srcSizeLogCount = 0;
     uint64_t lastRequestedBufferId = 0;
 
+    /* DEBUG: EGL_ANDROID_get_frame_timestamps is resolved dynamically so the
+     * API-24 minimum remains loadable.  No timestamp is used as a producer or
+     * consumer fence. */
+    PFNEGLGETNEXTFRAMEIDANDROIDPROC getNextFrameIdANDROID = nullptr;
+    PFNEGLGETFRAMETIMESTAMPSUPPORTEDANDROIDPROC getFrameTimestampSupportedANDROID = nullptr;
+    PFNEGLGETFRAMETIMESTAMPSANDROIDPROC getFrameTimestampsANDROID = nullptr;
+    PendingPresentFeedback pendingPresentFeedback[PRESENT_FEEDBACK_QUEUE_CAPACITY]{};
+    uint32_t presentFeedbackRead = 0, presentFeedbackWrite = 0;
+    uint32_t presentFeedbackSurfaceGeneration = 0;
+    uint32_t presentFeedbackPollSerialSeen = 0;
+    uint64_t rendererPresentSerial = 0;
+    bool presentFeedbackExtensionAvailable = false;
+    bool presentFeedbackSurfaceEnabled = false;
+
     volatile int* connFdPtr = nullptr;
 
     void init(JNIEnv* env, jobject thiz);
@@ -365,6 +416,14 @@ struct Renderer {
     void threadLoop();
     void bindTexture(GLuint id) const;
     void notifyGpuCopyDone() const;
+    void initializePresentFeedbackApi();
+    void configurePresentFeedbackSurface();
+    void resetPresentFeedback(bool notifyUnknown);
+    void pollPresentFeedback();
+    void recordPresentFeedback(uint64_t gpuCopySerial, int64_t submitNs,
+                               EGLuint64KHR eglFrameId);
+    void notifyPresentFeedback(const PendingPresentFeedback& pending,
+                               uint8_t status, int64_t presentNs) const;
     void reportViewport(int dstX, int dstY, int dstW, int dstH, float left, float top, float width, float height);
     void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip);
     void drawCursor(float displayWidth, float displayHeight, float sourceLeft, float sourceTop, float cursorX, float cursorY);

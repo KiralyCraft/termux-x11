@@ -49,6 +49,27 @@ __attribute__((weak)) EGLClientBuffer eglGetNativeClientBufferANDROID(const stru
 static GLuint createProgram(const char* p_vertex_source, const char* p_fragment_source);
 static void* printEglError(const char* msg, int line);
 
+static int64_t monotonicTimeNs() {
+    struct timespec now{};
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t) now.tv_sec * 1000000000LL + now.tv_nsec;
+}
+
+static bool hasEglExtension(const char* extensions, const char* wanted) {
+    size_t wantedLen;
+    const char* match;
+
+    if (!extensions || !wanted || strchr(wanted, ' '))
+        return false;
+    wantedLen = strlen(wanted);
+    for (match = strstr(extensions, wanted); match; match = strstr(match + wantedLen, wanted)) {
+        if ((match == extensions || match[-1] == ' ') &&
+            (match[wantedLen] == '\0' || match[wantedLen] == ' '))
+            return true;
+    }
+    return false;
+}
+
 /* DEBUG: Stage-E validation only.  This deliberately does not advertise a
  * direct-presentation capability or alter the production renderer.  A buffer
  * which can be imported for sampling is not necessarily a legal render
@@ -244,6 +265,151 @@ void Renderer::notifyGpuCopyDone() const {
     }
 }
 
+/* DEBUG: Actual Android-display timestamp observation.  This is deliberately
+ * independent from X Present completion and from PR96's producer fence. */
+void Renderer::initializePresentFeedbackApi() {
+    const char* extensions = eglQueryString(egl_display, EGL_EXTENSIONS);
+
+    presentFeedbackExtensionAvailable =
+        hasEglExtension(extensions, "EGL_ANDROID_get_frame_timestamps");
+    if (!presentFeedbackExtensionAvailable)
+        return;
+
+    getNextFrameIdANDROID = reinterpret_cast<PFNEGLGETNEXTFRAMEIDANDROIDPROC>(
+        eglGetProcAddress("eglGetNextFrameIdANDROID"));
+    getFrameTimestampSupportedANDROID =
+        reinterpret_cast<PFNEGLGETFRAMETIMESTAMPSUPPORTEDANDROIDPROC>(
+            eglGetProcAddress("eglGetFrameTimestampSupportedANDROID"));
+    getFrameTimestampsANDROID =
+        reinterpret_cast<PFNEGLGETFRAMETIMESTAMPSANDROIDPROC>(
+            eglGetProcAddress("eglGetFrameTimestampsANDROID"));
+    presentFeedbackExtensionAvailable = getNextFrameIdANDROID &&
+        getFrameTimestampSupportedANDROID && getFrameTimestampsANDROID;
+}
+
+void Renderer::notifyPresentFeedback(const PendingPresentFeedback& pending,
+                                     uint8_t status, int64_t presentNs) const {
+    if (!connFdPtr || *connFdPtr == -1)
+        return;
+
+    lorieEvent event{};
+    event.presentFeedback.t = EVENT_PRESENT_FEEDBACK;
+    event.presentFeedback.status = status;
+    event.presentFeedback.surfaceGeneration = pending.surfaceGeneration;
+    event.presentFeedback.rendererSerial = pending.rendererSerial;
+    event.presentFeedback.gpuCopySerial = pending.gpuCopySerial;
+    event.presentFeedback.eglFrameId = pending.eglFrameId;
+    event.presentFeedback.submitNs = pending.submitNs;
+    event.presentFeedback.presentNs = presentNs;
+    write(*connFdPtr, &event, sizeof(event));
+}
+
+void Renderer::resetPresentFeedback(bool notifyUnknown) {
+    while (presentFeedbackRead != presentFeedbackWrite) {
+        PendingPresentFeedback& pending =
+            pendingPresentFeedback[presentFeedbackRead % PRESENT_FEEDBACK_QUEUE_CAPACITY];
+        if (pending.valid && notifyUnknown)
+            notifyPresentFeedback(pending, LORIE_PRESENT_FEEDBACK_UNKNOWN, 0);
+        pending.valid = false;
+        presentFeedbackRead++;
+    }
+    presentFeedbackRead = presentFeedbackWrite = 0;
+    presentFeedbackSurfaceEnabled = false;
+    if (state)
+        __atomic_store_n(&state->presentFeedbackPending, 0, __ATOMIC_RELEASE);
+}
+
+void Renderer::configurePresentFeedbackSurface() {
+    resetPresentFeedback(true);
+    presentFeedbackSurfaceGeneration++;
+    presentFeedbackPollSerialSeen = state
+        ? __atomic_load_n(&state->presentFeedbackPollSerial, __ATOMIC_ACQUIRE)
+        : 0;
+
+    if (!state || !state->presentFeedbackEnabled || sfc == EGL_NO_SURFACE ||
+        sfc == defaultSfc || !presentFeedbackExtensionAvailable)
+        return;
+
+    presentFeedbackSurfaceEnabled =
+        getFrameTimestampSupportedANDROID(egl_display, sfc,
+                                          EGL_DISPLAY_PRESENT_TIME_ANDROID) == EGL_TRUE;
+    log("DEBUG: Android presentation timestamps %s for surface generation %u",
+        presentFeedbackSurfaceEnabled ? "enabled" : "unsupported",
+        presentFeedbackSurfaceGeneration);
+}
+
+void Renderer::recordPresentFeedback(uint64_t gpuCopySerial, int64_t submitNs,
+                                     EGLuint64KHR eglFrameId) {
+    if (!presentFeedbackSurfaceEnabled || !state || !state->presentFeedbackEnabled)
+        return;
+
+    if (presentFeedbackWrite - presentFeedbackRead >= PRESENT_FEEDBACK_QUEUE_CAPACITY) {
+        PendingPresentFeedback& oldest =
+            pendingPresentFeedback[presentFeedbackRead % PRESENT_FEEDBACK_QUEUE_CAPACITY];
+        if (oldest.valid)
+            notifyPresentFeedback(oldest, LORIE_PRESENT_FEEDBACK_UNKNOWN, 0);
+        oldest.valid = false;
+        presentFeedbackRead++;
+    }
+
+    PendingPresentFeedback& pending =
+        pendingPresentFeedback[presentFeedbackWrite % PRESENT_FEEDBACK_QUEUE_CAPACITY];
+    pending.valid = true;
+    pending.surfaceGeneration = presentFeedbackSurfaceGeneration;
+    pending.rendererSerial = ++rendererPresentSerial;
+    pending.gpuCopySerial = gpuCopySerial;
+    pending.eglFrameId = eglFrameId;
+    pending.submitNs = submitNs;
+    presentFeedbackWrite++;
+    __atomic_store_n(&state->presentFeedbackPending, 1, __ATOMIC_RELEASE);
+}
+
+void Renderer::pollPresentFeedback() {
+    const EGLint timestampName = EGL_DISPLAY_PRESENT_TIME_ANDROID;
+    int64_t nowNs;
+
+    if (state)
+        presentFeedbackPollSerialSeen =
+            __atomic_load_n(&state->presentFeedbackPollSerial, __ATOMIC_ACQUIRE);
+    if (!presentFeedbackSurfaceEnabled || presentFeedbackRead == presentFeedbackWrite)
+        return;
+
+    nowNs = monotonicTimeNs();
+    for (uint32_t cursor = presentFeedbackRead; cursor != presentFeedbackWrite; cursor++) {
+        PendingPresentFeedback& pending =
+            pendingPresentFeedback[cursor % PRESENT_FEEDBACK_QUEUE_CAPACITY];
+        EGLnsecsANDROID presentNs = EGL_TIMESTAMP_PENDING_ANDROID;
+        EGLBoolean queried;
+
+        if (!pending.valid)
+            continue;
+
+        queried = getFrameTimestampsANDROID(egl_display, sfc, pending.eglFrameId,
+                                             1, &timestampName, &presentNs);
+        if (queried == EGL_TRUE && presentNs != EGL_TIMESTAMP_PENDING_ANDROID &&
+            presentNs != EGL_TIMESTAMP_INVALID_ANDROID && presentNs > 0) {
+            notifyPresentFeedback(pending, LORIE_PRESENT_FEEDBACK_PRESENTED,
+                                  (int64_t) presentNs);
+            pending.valid = false;
+        } else if ((queried == EGL_TRUE && presentNs == EGL_TIMESTAMP_INVALID_ANDROID) ||
+                   nowNs - pending.submitNs >= 2000000000LL) {
+            /* Invalid means the frame did not acquire an actual display time;
+             * timeout is terminally unknown, never a fabricated presentation. */
+            notifyPresentFeedback(pending, LORIE_PRESENT_FEEDBACK_UNKNOWN, 0);
+            pending.valid = false;
+        }
+    }
+
+    while (presentFeedbackRead != presentFeedbackWrite &&
+           !pendingPresentFeedback[presentFeedbackRead % PRESENT_FEEDBACK_QUEUE_CAPACITY].valid)
+        presentFeedbackRead++;
+    if (presentFeedbackRead == presentFeedbackWrite) {
+        presentFeedbackRead = presentFeedbackWrite = 0;
+        if (state)
+            __atomic_store_n(&state->presentFeedbackPending, 0, __ATOMIC_RELEASE);
+    }
+}
+
 void Renderer::bindTexture(GLuint id) const {
     glBindTexture(GL_TEXTURE_2D, id);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filtering);
@@ -359,6 +525,7 @@ void* Renderer::initThread() {
         return printEglError("Unable to initialize EGL", __LINE__);
 
     log("Xlorie: Initialized EGL version %d.%d\n", major, minor);
+    initializePresentFeedbackApi();
     eglBindAPI(EGL_OPENGL_ES_API);
 
     if (eglChooseConfig(egl_display, configAttribs, &cfg, 1, &numConfigs) != EGL_TRUE &&
@@ -797,6 +964,10 @@ void Renderer::refreshContext() {
     int height = pendingWin ? ANativeWindow_getHeight(pendingWin) : 0;
     log("rendererSetWindow %p %d %d", pendingWin, width, height);
 
+    /* DEBUG: old EGL frame IDs are surface-scoped.  Retire unresolved records
+     * as unknown before destroying the surface rather than querying them on a
+     * new generation. */
+    resetPresentFeedback(true);
     releaseWinAndSurface(&win, &sfc);
 
     if (pendingWin && (width <= 0 || height <= 0)) {
@@ -829,6 +1000,7 @@ void Renderer::refreshContext() {
     }
 
     eglSwapInterval(egl_display, 0);
+    configurePresentFeedbackSurface();
 
     // We should redraw image at least once right after surface change
     if (state)
@@ -1163,8 +1335,15 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     state->waitForNextFrame = true;
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
 
+    EGLuint64KHR eglFrameId = 0;
+    bool trackPresent = presentFeedbackSurfaceEnabled &&
+        getNextFrameIdANDROID(egl_display, sfc, &eglFrameId) == EGL_TRUE;
+    int64_t submitNs = trackPresent ? monotonicTimeNs() : 0;
+
     if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE)
         printEglError("Failed to swap buffers", __LINE__);
+    else if (trackPresent)
+        recordPresentFeedback(gpuCopySerial, submitNs, eglFrameId);
 
     // Perform a little drawing operation to make sure the next buffer is ready on the next invocation of drawing
     glEnable(GL_SCISSOR_TEST);
@@ -1191,7 +1370,9 @@ bool Renderer::shouldWait(bool *waitingForBuffers) {
     buffersChanged = !xorg_list_is_empty(&addedBuffers) || !xorg_list_is_empty(&removedBuffers);
     pthread_spin_unlock(&bufferLock);
     gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
-    if (stateChanged || windowChanged || buffersChanged || gpuCopyPending)
+    if (stateChanged || windowChanged || buffersChanged || gpuCopyPending ||
+        (state && __atomic_load_n(&state->presentFeedbackPollSerial, __ATOMIC_ACQUIRE) !=
+                  presentFeedbackPollSerialSeen))
         // If there are pending changes we should process them immediately.
         return false;
 
@@ -1224,8 +1405,10 @@ void Renderer::threadLoop() {
 
         if (stateChanged) {
             struct lorie_shared_server_state* oldState = nullptr;
-            if (state && pendingState != state)
+            if (state && pendingState != state) {
+                resetPresentFeedback(true);
                 oldState = state;
+            }
 
             state = pendingState;
             pendingState = nullptr;
@@ -1242,6 +1425,9 @@ void Renderer::threadLoop() {
 
             if (oldState)
                 munmap(oldState, sizeof(*oldState));
+
+            if (state && win != defaultWin)
+                configurePresentFeedbackSurface();
         }
 
         if (windowChanged)
@@ -1258,6 +1444,10 @@ void Renderer::threadLoop() {
 
         pthread_cond_signal(&stateChangeFinishCond);
         pthread_mutex_unlock(&stateLock);
+
+        /* DEBUG: Choreographer wakes this existing renderer thread while an
+         * EGL timestamp is pending, including for an otherwise static frame. */
+        pollPresentFeedback();
 
         // Prefer a full redraw over the standalone apply below so a pending GPU copy shares one
         // lock+fence with the root/cursor draw, instead of two GPU round trips per frame.
@@ -1285,6 +1475,7 @@ void Renderer::threadLoop() {
     pthread_spin_unlock(&bufferLock);
 
     if (state) {
+        resetPresentFeedback(true);
         munmap(state, sizeof(*state));
         state = nullptr;
     }
