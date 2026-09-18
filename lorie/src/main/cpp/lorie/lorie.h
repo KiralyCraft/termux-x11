@@ -277,7 +277,7 @@ struct lorie_shared_server_state {
      * renderer submission.  GPU-copy tags travel in their queue entry. */
     struct {
         volatile uint32_t version;
-        volatile uint64_t claimedTag;
+        volatile uint64_t claimedTag __attribute__((aligned(8)));
         LoriePresentTag value;
     } latestPresentTag;
 
