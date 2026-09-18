@@ -604,7 +604,21 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     return 5000;
 }
 
+static void lorieResetVblankScheduler(void) {
+    pthread_mutex_lock(&pvfb->vblank_lock);
+    pvfb->pending_vblanks = 0;
+    pvfb->pending_vblank_ust = 0;
+    pvfb->redraw_queued = FALSE;
+    pthread_mutex_unlock(&pvfb->vblank_lock);
+}
+
 static Bool lorieCreateScreenResources(ScreenPtr pScreen) {
+    LorieBuffer *rootBuffer;
+
+    /* QueueWorkProc entries from the preceding server generation are not a
+     * valid reservation for this one. */
+    lorieResetVblankScheduler();
+
     pScreen->devPrivate = pScreen->CreatePixmap(pScreen, pScreen->width, pScreen->height, pScreen->rootDepth, CREATE_PIXMAP_USAGE_LORIEBUFFER_BACKED);
 
     pvfb->damage = DamageCreate(NULL, NULL, DamageReportNone, TRUE, pScreen, NULL);
@@ -622,7 +636,20 @@ static Bool lorieCreateScreenResources(ScreenPtr pScreen) {
     if (lorieServerDebugEnabled)
         pvfb->fpsTimer = TimerSet(NULL, 0, 5000, lorieFramecounter, pScreen);
 
-    lorieRegisterBuffer(LORIE_BUFFER_FROM_PIXMAP(pScreenPtr->devPrivate));
+    rootBuffer = LORIE_BUFFER_FROM_PIXMAP(pScreen->devPrivate);
+    lorieRegisterBuffer(rootBuffer);
+
+    /* Xorg may recreate screen resources after its last client exits without
+     * restarting the Termux:X11 processes.  Publish the replacement root
+     * immediately: waiting for a later damage/vblank leaves the Android
+     * renderer referring to the removed root buffer and the activity black.
+     */
+    if (rootBuffer) {
+        pvfb->state->rootWindowTextureID =
+            LorieBuffer_description(rootBuffer)->id;
+        pvfb->state->drawRequested = TRUE;
+        pthread_cond_signal(rendererCond);
+    }
 
     return TRUE;
 }
@@ -632,7 +659,13 @@ static Bool lorieCloseScreen(ScreenPtr pScreen) {
         TimerFree(pvfb->fpsTimer);
         pvfb->fpsTimer = NULL;
     }
+    /* Choreographer callbacks outlive an Xorg server generation.  A queued
+     * work proc belongs to the generation which created it and is discarded
+     * during reset; its coalescing reservation must not block redraws in the
+     * next generation.
+     */
     pScreenPtr = NULL;
+    lorieResetVblankScheduler();
     pScreen->DestroyPixmap(pScreen->devPrivate);
     pScreen->devPrivate = NULL;
     pScreen->CloseScreen = pvfb->CloseScreen;
