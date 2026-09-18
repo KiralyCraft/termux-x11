@@ -34,7 +34,7 @@
  * into an Android renderer frame.  tag is server-monotonic and is the
  * publication/correlation key; window and serial retain the originating
  * Present identity without changing standard Present completion semantics. */
-typedef struct {
+typedef struct __attribute__((aligned(8))) {
     uint64_t tag;
     uint32_t window;
     uint32_t serial;
