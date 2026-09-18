@@ -47,6 +47,105 @@ __attribute__((weak)) EGLClientBuffer eglGetNativeClientBufferANDROID(const stru
 } while (0)
 
 static GLuint createProgram(const char* p_vertex_source, const char* p_fragment_source);
+static void* printEglError(const char* msg, int line);
+
+/* DEBUG: Stage-E validation only.  This deliberately does not advertise a
+ * direct-presentation capability or alter the production renderer.  A buffer
+ * which can be imported for sampling is not necessarily a legal render
+ * target, so validate the prospective consumer-owned usage combination and
+ * an actual FBO write before a later protocol is allowed to rely on it. */
+static bool validateDirectPresentationTarget(EGLDisplay display) {
+    const EGLint imageAttributes[] = {EGL_IMAGE_PRESERVED_KHR, EGL_TRUE, EGL_NONE};
+    const uint8_t expected[4] = {0x23, 0x67, 0xAB, 0xFF};
+    AHardwareBuffer_Desc requested = {
+        .width = 64,
+        .height = 64,
+        .layers = 1,
+        .format = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM,
+        .usage = AHARDWAREBUFFER_USAGE_GPU_COLOR_OUTPUT |
+                 AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+                 AHARDWAREBUFFER_USAGE_COMPOSER_OVERLAY,
+    };
+    AHardwareBuffer_Desc actual = {};
+    AHardwareBuffer *buffer = nullptr;
+    EGLClientBuffer clientBuffer = nullptr;
+    EGLImageKHR image = EGL_NO_IMAGE_KHR;
+    GLuint texture = 0, fbo = 0;
+    uint8_t pixel[4] = {};
+    bool valid = false;
+
+    if (!__builtin_available(android 26, *)) {
+        loge("DEBUG: direct-target validation unavailable before API 26");
+        return false;
+    }
+
+    int status = AHardwareBuffer_allocate(&requested, &buffer);
+    if (status != 0 || !buffer) {
+        loge("DEBUG: direct-target AHardwareBuffer allocation failed: %d", status);
+        goto out;
+    }
+    AHardwareBuffer_describe(buffer, &actual);
+
+    clientBuffer = eglGetNativeClientBufferANDROID(buffer);
+    if (!clientBuffer) {
+        loge("DEBUG: direct-target EGL client-buffer import failed");
+        goto out;
+    }
+    image = eglCreateImageKHR(display, EGL_NO_CONTEXT, EGL_NATIVE_BUFFER_ANDROID,
+                              clientBuffer, imageAttributes);
+    if (image == EGL_NO_IMAGE_KHR) {
+        printEglError("DEBUG: direct-target EGLImage creation failed", __LINE__);
+        goto out;
+    }
+
+    /* Discard stale errors so the result describes this validation only. */
+    while (glGetError() != GL_NO_ERROR) {}
+    glGenTextures(1, &texture);
+    glBindTexture(GL_TEXTURE_2D, texture);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, image);
+    glGenFramebuffers(1, &fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                           GL_TEXTURE_2D, texture, 0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+        loge("DEBUG: direct-target EGLImage is not framebuffer-complete");
+        goto out;
+    }
+
+    glViewport(0, 0, 64, 64);
+    glClearColor((float) expected[0] / 255.f, (float) expected[1] / 255.f,
+                 (float) expected[2] / 255.f, 1.f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, pixel);
+    if (glGetError() != GL_NO_ERROR) {
+        loge("DEBUG: direct-target render/readback produced a GL error");
+        goto out;
+    }
+
+    valid = std::abs((int) pixel[0] - expected[0]) <= 1 &&
+            std::abs((int) pixel[1] - expected[1]) <= 1 &&
+            std::abs((int) pixel[2] - expected[2]) <= 1 &&
+            pixel[3] == expected[3];
+    loge("DEBUG: direct-target validation %s: %ux%u stride=%u format=%u "
+         "usage=0x%llx pixel=%02x%02x%02x%02x",
+         valid ? "passed" : "failed", actual.width, actual.height,
+         actual.stride, actual.format, (unsigned long long) actual.usage,
+         pixel[0], pixel[1], pixel[2], pixel[3]);
+
+out:
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (fbo)
+        glDeleteFramebuffers(1, &fbo);
+    if (texture)
+        glDeleteTextures(1, &texture);
+    if (image != EGL_NO_IMAGE_KHR)
+        eglDestroyImageKHR(display, image);
+    if (buffer)
+        AHardwareBuffer_release(buffer);
+    return valid;
+}
 
 static void* printEglError(const char* msg, int line) {
     char descBuf[32] = {0};
@@ -523,6 +622,11 @@ void Renderer::testCapabilities(int* legacy_drawing, int* gpu_present_disabled) 
             log("Xlorie: GLES receives broken pixels. Forcing legacy drawing. 0x%X\n", pixel[0]);
             *legacy_drawing = 1;
         }
+        /* DEBUG: Explicitly requested research probe.  It is intentionally
+         * validation-only: no capability is exposed and no presentation path
+         * changes even when it passes. */
+        if (getenv("TERMUX_X11_EXPERIMENTAL_DIRECT_VALIDATE"))
+            validateDirectPresentationTarget(egl_display);
         eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
         eglDestroyContext(egl_display, testctx);
         eglDestroyImageKHR(egl_display, img);
