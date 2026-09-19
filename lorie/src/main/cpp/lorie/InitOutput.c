@@ -215,6 +215,7 @@ void OsVendorInit(void) {
         lorieScreen.state->presentFeedbackEnabled =
             enabled && strcmp(enabled, "0") != 0;
     }
+    lorieScreen.state->rendererTimingEnabled = lorieServerDebugEnabled;
 
     lorieListenForKnocks();
 }
@@ -694,6 +695,8 @@ void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
 
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
     uint64_t actual, unknown, totalNs, maxNs, correlated, uncorrelated;
+    uint32_t swapCount, swapTotalUs, swapMaxUs, swapOverPeriod;
+    uint32_t acquireCount, acquireTotalUs, acquireMaxUs, acquireOverPeriod;
 
     pthread_mutex_lock(&pvfb->presentFeedbackLock);
     actual = pvfb->presentFeedbackPresented;
@@ -710,6 +713,24 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->presentFeedbackUncorrelated = 0;
     pthread_mutex_unlock(&pvfb->presentFeedbackLock);
 
+    swapCount = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.swapCount, 0, __ATOMIC_ACQ_REL);
+    swapTotalUs = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.swapTotalUs, 0, __ATOMIC_ACQ_REL);
+    swapMaxUs = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.swapMaxUs, 0, __ATOMIC_ACQ_REL);
+    swapOverPeriod = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.swapOverPeriod, 0, __ATOMIC_ACQ_REL);
+    acquireCount = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.acquireCount, 0, __ATOMIC_ACQ_REL);
+    acquireTotalUs = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.acquireTotalUs, 0, __ATOMIC_ACQ_REL);
+    acquireMaxUs = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.acquireMaxUs, 0, __ATOMIC_ACQ_REL);
+    acquireOverPeriod = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.acquireOverPeriod, 0,
+        __ATOMIC_ACQ_REL);
+
     if (pvfb->state->renderedFrames || gpuCopyAttempts)
         log(INFO, gpuCopyAttempts ? "%d frames in 5.0 seconds = %.1f FPS, %llu/%llu present copies offloaded to GPU"
                                    : "%d frames in 5.0 seconds = %.1f FPS",
@@ -722,6 +743,14 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             (unsigned long long) uncorrelated,
             actual ? (double) totalNs / (double) actual / 1000000.0 : 0.0,
             (double) maxNs / 1000000.0);
+    if (swapCount || acquireCount)
+        log(INFO, "DEBUG: renderer capacity: swap %u mean %.3fms max %.3fms over-period %u; next-buffer %u mean %.3fms max %.3fms over-period %u",
+            swapCount,
+            swapCount ? (double) swapTotalUs / (double) swapCount / 1000.0 : 0.0,
+            (double) swapMaxUs / 1000.0, swapOverPeriod,
+            acquireCount,
+            acquireCount ? (double) acquireTotalUs / (double) acquireCount / 1000.0 : 0.0,
+            (double) acquireMaxUs / 1000.0, acquireOverPeriod);
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
     return 5000;

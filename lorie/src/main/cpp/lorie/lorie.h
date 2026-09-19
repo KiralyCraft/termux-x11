@@ -309,6 +309,22 @@ struct lorie_shared_server_state {
     /* Needed to show FPS counter in logcat */
     volatile int renderedFrames;
 
+    /* DEBUG: observation-only renderer timing.  Keep these counters 32-bit so
+     * all supported ABIs can update them atomically without imposing another
+     * alignment contract on the shared region.  The X server drains them
+     * every five seconds while TERMUX_X11_DEBUG is enabled. */
+    volatile uint8_t rendererTimingEnabled;
+    struct {
+        volatile uint32_t swapCount;
+        volatile uint32_t swapTotalUs;
+        volatile uint32_t swapMaxUs;
+        volatile uint32_t swapOverPeriod;
+        volatile uint32_t acquireCount;
+        volatile uint32_t acquireTotalUs;
+        volatile uint32_t acquireMaxUs;
+        volatile uint32_t acquireOverPeriod;
+    } rendererTiming;
+
     /* DEBUG: presentation-timestamp collection is explicitly enabled by the
      * X server and only keeps the renderer awake while records are pending. */
     volatile uint8_t presentFeedbackEnabled;

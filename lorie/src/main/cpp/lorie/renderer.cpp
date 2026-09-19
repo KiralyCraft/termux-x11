@@ -55,6 +55,40 @@ static int64_t monotonicTimeNs() {
     return (int64_t) now.tv_sec * 1000000000LL + now.tv_nsec;
 }
 
+/* DEBUG: Record where renderer capacity is consumed without changing the
+ * existing BufferQueue behavior.  Five-second draining keeps the 32-bit
+ * totals bounded during diagnostics; saturating addition also makes a lost
+ * timer harmless. */
+static void recordRendererDuration(volatile uint32_t* count,
+                                   volatile uint32_t* totalUs,
+                                   volatile uint32_t* maxUs,
+                                   volatile uint32_t* overPeriod,
+                                   int64_t startNs, int64_t endNs) {
+    uint64_t durationUs64;
+    uint32_t durationUs, oldTotal, newTotal, oldMax;
+
+    if (endNs <= startNs)
+        return;
+    durationUs64 = (uint64_t) (endNs - startNs) / 1000;
+    durationUs = durationUs64 > UINT32_MAX ? UINT32_MAX :
+        (uint32_t) durationUs64;
+    __atomic_fetch_add(count, 1, __ATOMIC_RELAXED);
+    oldTotal = __atomic_load_n(totalUs, __ATOMIC_RELAXED);
+    do {
+        newTotal = UINT32_MAX - oldTotal < durationUs ? UINT32_MAX :
+            oldTotal + durationUs;
+    } while (!__atomic_compare_exchange_n(totalUs, &oldTotal, newTotal,
+                                           false, __ATOMIC_RELAXED,
+                                           __ATOMIC_RELAXED));
+    oldMax = __atomic_load_n(maxUs, __ATOMIC_RELAXED);
+    while (oldMax < durationUs &&
+           !__atomic_compare_exchange_n(maxUs, &oldMax, durationUs, false,
+                                        __ATOMIC_RELAXED,
+                                        __ATOMIC_RELAXED)) {}
+    if (durationUs > 16667)
+        __atomic_fetch_add(overPeriod, 1, __ATOMIC_RELAXED);
+}
+
 static bool hasEglExtension(const char* extensions, const char* wanted) {
     size_t wantedLen;
     const char* match;
@@ -1501,7 +1535,16 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
         getNextFrameIdANDROID(egl_display, sfc, &eglFrameId) == EGL_TRUE;
     int64_t submitNs = trackPresent ? monotonicTimeNs() : 0;
 
-    if (eglSwapBuffers(egl_display, sfc) != EGL_TRUE) {
+    int64_t swapStartNs = state->rendererTimingEnabled ? monotonicTimeNs() : 0;
+    EGLBoolean swapResult = eglSwapBuffers(egl_display, sfc);
+    if (state->rendererTimingEnabled)
+        recordRendererDuration(&state->rendererTiming.swapCount,
+                               &state->rendererTiming.swapTotalUs,
+                               &state->rendererTiming.swapMaxUs,
+                               &state->rendererTiming.swapOverPeriod,
+                               swapStartNs, monotonicTimeNs());
+
+    if (swapResult != EGL_TRUE) {
         printEglError("Failed to swap buffers", __LINE__);
         retirePresentTagUnknown(framePresentTag, gpuCopySerial);
     } else {
@@ -1515,6 +1558,7 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     }
 
     // Perform a little drawing operation to make sure the next buffer is ready on the next invocation of drawing
+    int64_t acquireStartNs = state->rendererTimingEnabled ? monotonicTimeNs() : 0;
     glEnable(GL_SCISSOR_TEST);
     glScissor(0, 0, 1, 1);
     glClearColor(0, 0, 0, 0);
@@ -1523,6 +1567,12 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     fence = eglCreateSyncKHR(egl_display, EGL_SYNC_FENCE_KHR, nullptr);
     eglClientWaitSyncKHR(egl_display, fence, EGL_SYNC_FLUSH_COMMANDS_BIT_KHR, EGL_FOREVER);
     eglDestroySyncKHR(egl_display, fence);
+    if (state->rendererTimingEnabled)
+        recordRendererDuration(&state->rendererTiming.acquireCount,
+                               &state->rendererTiming.acquireTotalUs,
+                               &state->rendererTiming.acquireMaxUs,
+                               &state->rendererTiming.acquireOverPeriod,
+                               acquireStartNs, monotonicTimeNs());
 
     state->renderedFrames++;
 }
