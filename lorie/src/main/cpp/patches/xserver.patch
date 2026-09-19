@@ -570,7 +570,7 @@ index f3e5679b5d1c182d2a0e89b2a27506a000e7fdb7..c02a22994bf3892672d1d17921d3a860
 +                         stuff->target_msc, stuff->divisor, stuff->remainder,
 +                         notifies, nnotifies, lorie_feedback_ptr);
 diff --git a/present/present_scmd.c b/present/present_scmd.c
-index 239055bc10d8c934555356c4213cda37dbff711e..54a957a0c733e7419a775698d5b4541f2dbf34af 100644
+index 239055bc10d8c934555356c4213cda37dbff711e..a7dfd61f66ed4ad741965133f40f38558ae38faf 100644
 --- a/present/present_scmd.c
 +++ b/present/present_scmd.c
 @@ -254,0 +255,15 @@ present_flip_try_ready(ScreenPtr screen)
@@ -608,7 +608,33 @@ index 239055bc10d8c934555356c4213cda37dbff711e..54a957a0c733e7419a775698d5b4541f
 -                    int num_notifies)
 +                    int num_notifies,
 +                    const present_lorie_feedback_target_rec *lorie_feedback)
-@@ -763 +793,2 @@ present_scmd_pixmap(WindowPtr window,
+@@ -723,0 +754,25 @@ present_scmd_pixmap(WindowPtr window,
++    /* A paced client may deliberately keep one future submission queued.
++     * If an earlier target became stale before the server processed it,
++     * present_get_target_msc() moves it to the next MSC.  Applying the same
++     * normalization to the following request can otherwise give both requests
++     * one target, causing the standard same-frame replacement below to retire
++     * useful FIFO work.  The private feedback contract identifies the bounded
++     * paced path, so preserve its order on the authoritative server timeline
++     * without changing ordinary Present scheduling. */
++    if (lorie_feedback &&
++        (lorie_feedback->options &
++         (LoriePresentOptionActualFeedback |
++          LoriePresentOptionBackendRelease))) {
++        xorg_list_for_each_entry(vblank, &window_priv->vblank, window_list) {
++            if (!vblank->pixmap || !vblank->queued ||
++                vblank->crtc != target_crtc ||
++                !vblank->lorie_feedback.eid ||
++                vblank->lorie_feedback_handed_off ||
++                vblank->lorie_feedback_terminal_sent)
++                continue;
++
++            if (!msc_is_after(target_msc, vblank->target_msc))
++                target_msc = vblank->target_msc + 1;
++        }
++    }
++
+@@ -763 +818,2 @@ present_scmd_pixmap(WindowPtr window,
 -                                   crtc_msc);
 +                                   crtc_msc,
 +                                   lorie_feedback);
