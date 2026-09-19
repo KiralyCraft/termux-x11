@@ -13,9 +13,9 @@ Termux:X11 commit `a30a4defe9bb70aec2169244e524e67a52cfcd55`, with unused
 future deadline-transport groundwork removed.
 
 Use it with the Mesa branch
-[`kgsl-present-wait-fence-paced`](https://github.com/KiralyCraft/mesa-for-android-container/tree/kgsl-present-wait-fence-paced)
+[`kgsl-present-wait-fence-paced-minimal`](https://github.com/KiralyCraft/mesa-for-android-container/tree/kgsl-present-wait-fence-paced-minimal)
 pinned to commit
-[`dcb971f9cdaa69587f1e3c92e85915e421827239`](https://github.com/KiralyCraft/mesa-for-android-container/commit/dcb971f9cdaa69587f1e3c92e85915e421827239).
+[`77249885404540ccdbda31bc8994a69cf2ba757d`](https://github.com/KiralyCraft/mesa-for-android-container/commit/77249885404540ccdbda31bc8994a69cf2ba757d).
 That exact SHA, rather than the moving branch tip, is the matching validated
 Mesa implementation.
 
