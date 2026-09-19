@@ -475,7 +475,10 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                     auto *event = static_cast<lorieEvent*>(closure);
                     lorieHandlePresentBackendRelease(
                         event->presentBackendRelease.mode,
-                        event->presentBackendRelease.presentTag);
+                        event->presentBackendRelease.presentTag,
+                        event->presentBackendRelease.deadlineUs,
+                        event->presentBackendRelease.expectedUs,
+                        event->presentBackendRelease.opportunityMsc);
                     free(event);
                     return TRUE;
                 }, nullptr, copy);

@@ -28,6 +28,12 @@
 #define LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE (1u << 29)
 #define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
 #define LORIE_PRESENT_CAP_FRAME_TIMELINE          (1u << 31)
+/* The server attaches the API-33 Choreographer deadline, expected-present
+ * time, and opportunity MSC to private backend-release events.  Keep this
+ * separate from FRAME_TIMELINE so a new Mesa does not assume that older
+ * experimental servers publish the payload merely because they use the
+ * Choreographer callback internally. */
+#define LORIE_PRESENT_CAP_TIMELINE_NOTIFY          (1u << 26)
 
 /* Per-request opt-in.  The matching Mesa loader only sets this after the
  * capability above was advertised, so unmodified servers never see it. */
@@ -73,6 +79,14 @@ typedef struct __attribute__((aligned(8))) {
     uint32_t options;
 } LoriePresentTag;
 
+/* Scheduling metadata for the Android opportunity sampled when a renderer
+ * frame begins.  It never establishes producer or consumer completion. */
+typedef struct __attribute__((aligned(8))) {
+    uint64_t deadlineUs;
+    uint64_t expectedUs;
+    uint64_t opportunityMsc;
+} LorieFrameTimeline;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -96,7 +110,10 @@ void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
                                 uint64_t egl_frame_id, int64_t submit_ns,
                                 int64_t present_ns);
 void lorieHandlePresentBackendRelease(uint8_t mode,
-                                      LoriePresentTag present_tag);
+                                      LoriePresentTag present_tag,
+                                      uint64_t deadline_us,
+                                      uint64_t expected_us,
+                                      uint64_t opportunity_msc);
 void lorieChoreographerStart(AChoreographer *choreographer);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
@@ -251,6 +268,11 @@ typedef union {
         uint8_t mode;
         uint16_t reserved;
         LoriePresentTag presentTag;
+        /* API-33 scheduling metadata only.  These fields are zero on the
+         * compatibility path and never establish producer completion. */
+        uint64_t deadlineUs;
+        uint64_t expectedUs;
+        uint64_t opportunityMsc;
     } presentBackendRelease;
     struct {
         uint8_t t;
@@ -308,6 +330,17 @@ struct lorie_shared_server_state {
         volatile uint64_t claimedTag __attribute__((aligned(8)));
         LoriePresentTag value;
     } latestPresentTag;
+
+    /* API-33 Choreographer scheduling metadata, published by the X-server
+     * callback and sampled by the renderer when it consumes root contents.
+     * The seqlock avoids torn 64-bit observations on armeabi-v7a. */
+    struct {
+        volatile uint32_t version;
+        uint32_t reserved;
+        uint64_t deadlineUs __attribute__((aligned(8)));
+        uint64_t expectedUs;
+        uint64_t opportunityMsc;
+    } latestFrameTimeline;
 
     /* ID of root window texture to be drawn. */
     uint64_t rootWindowTextureID;
@@ -540,7 +573,8 @@ struct Renderer {
     void notifyPresentFeedback(const PendingPresentFeedback& pending,
                                uint8_t status, int64_t presentNs) const;
     void notifyPresentBackendRelease(const LoriePresentTag& presentTag,
-                                     uint8_t mode) const;
+                                     uint8_t mode,
+                                     const LorieFrameTimeline* timeline = nullptr) const;
     void reportViewport(int dstX, int dstY, int dstW, int dstH, float left, float top, float width, float height);
     void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip);
     void drawCursor(float displayWidth, float displayHeight, float sourceLeft, float sourceTop, float cursorX, float cursorY);

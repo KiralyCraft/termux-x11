@@ -2,63 +2,114 @@ diff --git a/Xext/shm.c b/Xext/shm.c
 index 1eed91bc552e249e2fb1141d9082ef088c67a235..7405223e759d6d4eef9807714d58b31c34843c5b 100644
 --- a/Xext/shm.c
 +++ b/Xext/shm.c
-@@ -195,0 +196,4 @@ CheckForShmSyscall(void)
+@@ -193,6 +193,10 @@ CheckForShmSyscall(void)
+ 
+ #endif
+ 
 +const DevPrivateKey ShmGetDevPrivateKeyRec(void) {
 +    return shmPixmapPrivateKey;
 +}
 +
+ static Bool
+ ShmCloseScreen(ScreenPtr pScreen)
+ {
 diff --git a/Xext/shmint.h b/Xext/shmint.h
 index 9dadea756db60d4160145da3db03a259867a68dd..e4e6f4db6fa8f03530287c97a3cc2efda2d6975d 100644
 --- a/Xext/shmint.h
 +++ b/Xext/shmint.h
-@@ -82,0 +83,2 @@ typedef struct _ShmDesc {
+@@ -80,6 +80,8 @@ typedef struct _ShmDesc {
+ #define SHMDESC_IS_FD(shmdesc)  (0)
+ #endif
+ 
 +extern const DevPrivateKey ShmGetDevPrivateKeyRec(void);
 +
+ extern _X_EXPORT void
+  ShmRegisterFuncs(ScreenPtr pScreen, ShmFuncsPtr funcs);
+ 
 diff --git a/dix/dixutils.c b/dix/dixutils.c
 index 331ccfb963eb7fdf9a5350ae1fc608b4d1cd4875..f9e7fe357c2480fc32bbedcbc95f4f22f1161dfa 100644
 --- a/dix/dixutils.c
 +++ b/dix/dixutils.c
-@@ -506,0 +507,5 @@ InitBlockAndWakeupHandlers(void)
+@@ -504,6 +504,11 @@ InitBlockAndWakeupHandlers(void)
+  * sleeps for input.
+  */
+ 
 +#define ClearWorkQueue _ClearWorkQueue
 +#define ProcessWorkQueue _ProcessWorkQueue
 +#define ProcessWorkQueueZombies _ProcessWorkQueueZombies
 +#define QueueWorkProc _QueueWorkProc
 +
-@@ -585,0 +591,5 @@ QueueWorkProc(Bool (*function) (ClientPtr pClient, void *closure),
+ WorkQueuePtr workQueue;
+ static WorkQueuePtr *workQueueLast = &workQueue;
+ 
+@@ -583,6 +588,11 @@ QueueWorkProc(Bool (*function) (ClientPtr pClient, void *closure),
+     return TRUE;
+ }
+ 
 +#undef ClearWorkQueue
 +#undef ProcessWorkQueue
 +#undef ProcessWorkQueueZombies
 +#undef QueueWorkProc
 +
+ /*
+  * Manage a queue of sleeping clients, awakening them
+  * when requested, by using the OS functions IgnoreClient
 diff --git a/dix/enterleave.c b/dix/enterleave.c
 index 18b5d66cd3c84c611fba44f9c83391db37f118e6..a6fa80d8bae894a3ddb0f92b2660931641104135 100644
 --- a/dix/enterleave.c
 +++ b/dix/enterleave.c
-@@ -1543,0 +1544,2 @@ DeviceFocusEvents(DeviceIntPtr dev, WindowPtr from, WindowPtr to, int mode)
+@@ -1541,6 +1541,8 @@ DeviceFocusEvents(DeviceIntPtr dev, WindowPtr from, WindowPtr to, int mode)
+     }
+ }
+ 
 +extern void DDXNotifyFocusChanged(void);
 +
-@@ -1553,0 +1556,3 @@ DoFocusEvents(DeviceIntPtr pDev, WindowPtr from, WindowPtr to, int mode)
+ /**
+  * Figure out if focus events are necessary and send them to the
+  * appropriate windows.
+@@ -1551,6 +1553,9 @@ DeviceFocusEvents(DeviceIntPtr dev, WindowPtr from, WindowPtr to, int mode)
+ void
+ DoFocusEvents(DeviceIntPtr pDev, WindowPtr from, WindowPtr to, int mode)
+ {
 +    if (from != to)
 +        DDXNotifyFocusChanged();
 +
+     if (!IsKeyboardDevice(pDev))
+         return;
+ 
 diff --git a/dix/main.c b/dix/main.c
 index 38e29cebbe7c82c195e11f8d47805b44d459c780..e4957e9bc30601a4bc43936aea08779f9cc5a98c 100644
 --- a/dix/main.c
 +++ b/dix/main.c
-@@ -270,0 +271 @@ dix_main(int argc, char *argv[], char *envp[])
+@@ -268,6 +268,7 @@ dix_main(int argc, char *argv[], char *envp[])
+         }
+ 
+         NotifyParentProcess();
 +        ddxReady();
+ 
+         InputThreadInit();
+ 
 diff --git a/include/os.h b/include/os.h
 index 7db24088f8512f2eb149d47eb807d5d6a33a0e19..b782360bcbf2969fc3f9d32aa1acb1d1eff3abab 100644
 --- a/include/os.h
 +++ b/include/os.h
-@@ -559,0 +560,2 @@ extern _X_EXPORT void
+@@ -557,6 +557,8 @@ enum ExitCode {
+ extern _X_EXPORT void
+ ddxGiveUp(enum ExitCode error);
+ extern _X_EXPORT void
 +ddxReady(void);
 +extern _X_EXPORT void
+ ddxInputThreadInit(void);
+ extern _X_EXPORT int
+ TimeSinceLastInputEvent(void);
 diff --git a/include/xkbfile.h b/include/xkbfile.h
 index f93d31ab070333c9a03947ba67346dfefce2cff8..f65338ac4628874ddf427cddc9dcc74f77e2052a 100644
 --- a/include/xkbfile.h
 +++ b/include/xkbfile.h
-@@ -81,0 +82,30 @@ typedef void (*XkbFileAddOnFunc) (FILE * /* file */ ,
+@@ -79,6 +79,36 @@ typedef void (*XkbFileAddOnFunc) (FILE * /* file */ ,
+ 
+ /***====================================================================***/
+ 
 +#define XkbInternAtom XXkbInternAtom
 +#define XkbAtomText XXkbAtomText
 +#define XkbStringText XXkbStringText
@@ -89,41 +140,80 @@ index f93d31ab070333c9a03947ba67346dfefce2cff8..f65338ac4628874ddf427cddc9dcc74f
 +#define XkbNameMatchesPattern XXkbNameMatchesPattern
 +#define _XkbKSCheckCase _XXkbKSCheckCase
 +
+ _XFUNCPROTOBEGIN
+ 
+ extern _X_EXPORT char *XkbIndentText(unsigned   /* size */
 diff --git a/os/connection.c b/os/connection.c
 index 35e2a4d45a438596d8dab361bb4a73e56bb2b487..2e80d88353326877c3b1d2a90563624fca5320e1 100644
 --- a/os/connection.c
 +++ b/os/connection.c
-@@ -187,0 +188 @@ InitParentProcess(void)
+@@ -185,9 +185,10 @@ InitParentProcess(void)
+ {
+ #if !defined(WIN32)
+     OsSigHandlerPtr handler;
 +    const char *notifyParent = getenv("TERMUX_X11_NOTIFY_PARENT");
-@@ -190 +191 @@ InitParentProcess(void)
+ 
+     handler = OsSignal(SIGUSR1, SIG_IGN);
 -    if (handler == SIG_IGN)
 +    if (handler == SIG_IGN || (notifyParent && !strcmp(notifyParent, "1")))
+         RunFromSmartParent = TRUE;
+     OsSignal(SIGUSR1, handler);
+     ParentProcess = getppid();
 diff --git a/os/osinit.c b/os/osinit.c
 index 8575319fff617e2f56cc6d14078312f07c8e3356..a6d0dfcccd363640dbf17a119e31ba9c0d7781c3 100644
 --- a/os/osinit.c
 +++ b/os/osinit.c
-@@ -173 +173 @@ OsInit(void)
+@@ -170,13 +170,11 @@ OsInit(void)
+ #endif
+ 
+     if (!been_here) {
 -#if !defined(WIN32) || defined(__CYGWIN__)
 +#if !defined(WIN32) || defined(__CYGWIN__) || !defined(__ANDROID__)
-@@ -177,3 +177 @@ OsInit(void)
+         struct sigaction act, oact;
+         int i;
+ 
 -        int siglist[] = { SIGSEGV, SIGQUIT, SIGILL, SIGFPE, SIGBUS,
 -            SIGABRT,
 -            SIGSYS,
 +        int siglist[] = { SIGQUIT, SIGILL, SIGFPE,
+             SIGXCPU,
+             SIGXFSZ,
+ #ifdef SIGEMT
 diff --git a/os/utils.c b/os/utils.c
 index 008ed0463930370aa673c57aa1a7fdc52d471309..fae554b22e49b801bd278da4ed835c16b6f32110 100644
 --- a/os/utils.c
 +++ b/os/utils.c
-@@ -216,0 +217,2 @@ OsSignal(int sig, OsSigHandlerPtr handler)
+@@ -214,6 +214,8 @@ OsSignal(int sig, OsSigHandlerPtr handler)
+ {
+ #if defined(WIN32) && !defined(__CYGWIN__)
+     return signal(sig, handler);
 +#elif defined(__ANDROID__)
 +    return SIG_DFL;
-@@ -237 +239 @@ OsSignal(int sig, OsSigHandlerPtr handler)
+ #else
+     struct sigaction act, oact;
+ 
+@@ -234,7 +236,7 @@ OsSignal(int sig, OsSigHandlerPtr handler)
+  * server at a time.  This keeps the servers from stomping on each other
+  * if the user forgets to give them different display numbers.
+  */
 -#define LOCK_DIR "/tmp"
 +#define LOCK_DIR (getenv("TMPDIR") ?: "/tmp")
-@@ -329 +331 @@ LockServer(void)
+ #define LOCK_TMP_PREFIX "/.tX"
+ #define LOCK_PREFIX "/.X"
+ #define LOCK_SUFFIX "-lock"
+@@ -326,7 +328,7 @@ LockServer(void)
+     i = 0;
+     haslock = 0;
+     while ((!haslock) && (i++ < 3)) {
 -        haslock = (link(tmp, LockFile) == 0);
 +        haslock = (rename(tmp, LockFile) == 0);
-@@ -1423,0 +1426,33 @@ static struct pid {
+         if (haslock) {
+             /*
+              * We're done.
+@@ -1421,12 +1423,45 @@ static struct pid {
+     int pid;
+ } *pidlist;
+ 
 +#include <fcntl.h>
 +#include <android/log.h>
 +
@@ -157,18 +247,40 @@ index 008ed0463930370aa673c57aa1a7fdc52d471309..fae554b22e49b801bd278da4ed835c16
 +            __android_log_write(ANDROID_LOG_DEBUG, "xkbcomp", line);
 +}
 +
-@@ -1429 +1464 @@ Popen(const char *command, const char *type)
+ void *
+ Popen(const char *command, const char *type)
+ {
+     struct pid *cur;
+     FILE *iop;
 -    int pdes[2], pid;
 +    int pdes[2], odes[2] = { -1, -1 }, pid;
-@@ -1444,0 +1480,4 @@ Popen(const char *command, const char *type)
+ 
+     if (command == NULL || type == NULL)
+         return NULL;
+@@ -1442,6 +1477,10 @@ Popen(const char *command, const char *type)
+         return NULL;
+     }
+ 
 +    if (pipe(odes) == 0)
 +        /* Nothing drains this one until xkbcomp is done, so a full pipe must not block it. */
 +        fcntl(odes[1], F_SETFL, O_NONBLOCK);
 +
-@@ -1459,0 +1499,2 @@ Popen(const char *command, const char *type)
+     /* Ignore the smart scheduler while this is going on */
+ #ifdef HAVE_SETITIMER
+     if (SmartSchedulePause() < 0) {
+@@ -1457,6 +1496,8 @@ Popen(const char *command, const char *type)
+     case -1:                   /* error */
+         close(pdes[0]);
+         close(pdes[1]);
 +        close(odes[0]);
 +        close(odes[1]);
-@@ -1487,2 +1528,12 @@ Popen(const char *command, const char *type)
+         free(cur);
+ #ifdef HAVE_SETITIMER
+         if (SmartScheduleEnable() < 0)
+@@ -1484,14 +1525,29 @@ Popen(const char *command, const char *type)
+             }
+             close(pdes[1]);
+         }
 -        execl("/bin/sh", "sh", "-c", command, (char *) NULL);
 -        _exit(127);
 +
@@ -183,37 +295,76 @@ index 008ed0463930370aa673c57aa1a7fdc52d471309..fae554b22e49b801bd278da4ed835c16
 +            signal(j, SIG_DFL);
 +
 +        _exit(xkbcomp_main(xkbcomp_argc, xkbcomp_argv));
-@@ -1494,0 +1546,5 @@ Popen(const char *command, const char *type)
+     }
+ 
+     /* Avoid EINTR during stdio calls */
+     OsBlockSignals();
+ 
+     /* parent */
 +    if (odes[1] >= 0) {
 +        close(odes[1]);
 +        xkbcomp_output_fd = odes[0];
 +    }
 +
-@@ -1630,0 +1687,2 @@ Pclose(void *iop)
+     if (*type == 'r') {
+         iop = fdopen(pdes[0], type);
+         close(pdes[1]);
+@@ -1628,6 +1684,8 @@ Pclose(void *iop)
+         pid = waitpid(cur->pid, &pstat, 0);
+     } while (pid == -1 && errno == EINTR);
+ 
 +    ReportXkbcompOutput(pid == -1 || !WIFEXITED(pstat) || WEXITSTATUS(pstat) != 0);
 +
+     if (last == NULL)
+         pidlist = cur->next;
+     else
 diff --git a/present/present.c b/present/present.c
 index 271fe32bc8b389498171dc572f17f5cd611ff167..560e24b1614ec9bf0dd9c49a87f05069f9b4a07d 100644
 --- a/present/present.c
 +++ b/present/present.c
-@@ -238 +238,2 @@ present_pixmap(WindowPtr window,
+@@ -235,7 +235,8 @@ present_pixmap(WindowPtr window,
+                uint64_t divisor,
+                uint64_t remainder,
+                present_notify_ptr notifies,
 -               int num_notifies)
 +               int num_notifies,
 +               const present_lorie_feedback_target_rec *lorie_feedback)
-@@ -258 +259,2 @@ present_pixmap(WindowPtr window,
+ {
+     ScreenPtr                   screen = window->drawable.pScreen;
+     present_screen_priv_ptr     screen_priv = present_screen_priv(screen);
+@@ -255,7 +256,8 @@ present_pixmap(WindowPtr window,
+                                        divisor,
+                                        remainder,
+                                        notifies,
 -                                       num_notifies);
 +                                       num_notifies,
 +                                       lorie_feedback);
-@@ -276 +278 @@ present_notify_msc(WindowPtr window,
+ }
+ 
+ int
+@@ -273,5 +275,5 @@ present_notify_msc(WindowPtr window,
+                           NULL,
+                           NULL, NULL,
+                           divisor == 0 ? PresentOptionAsync : 0,
 -                          target_msc, divisor, remainder, NULL, 0);
 +                          target_msc, divisor, remainder, NULL, 0, NULL);
+ }
 diff --git a/present/present_event.c b/present/present_event.c
-index 849732dc880c4627ff80ae8eed6d3794d906e2d6..eddea16c6d974b1579cb536de67fc73f719c48da 100644
+index 849732dc880c4627ff80ae8eed6d3794d906e2d6..04afd626ebc302faf8ee36a7b93fe2ad0de0ed90 100644
 --- a/present/present_event.c
 +++ b/present/present_event.c
-@@ -25,0 +26 @@ static RESTYPE present_event_type;
+@@ -23,6 +23,7 @@
+ #include "present_priv.h"
+ 
+ static RESTYPE present_event_type;
 +static uint64_t present_lorie_event_generation;
-@@ -178,0 +180,112 @@ present_send_complete_notify(WindowPtr window, CARD8 kind, CARD8 mode, CARD32 se
+ 
+ static int
+ present_free_event(void *data, XID id)
+@@ -176,6 +177,141 @@ present_send_complete_notify(WindowPtr window, CARD8 kind, CARD8 mode, CARD32 se
+         (*complete_notify)(window, kind, mode, serial, ust, msc);
+ }
+ 
 +/* Private, capability-negotiated delivery to the exact event selection which
 + * opted in.  Standard CompleteNotify remains broadcast according to the
 + * Present protocol; this additional kind must never reach legacy clients. */
@@ -289,7 +440,8 @@ index 849732dc880c4627ff80ae8eed6d3794d906e2d6..eddea16c6d974b1579cb536de67fc73f
 +Bool
 +present_lorie_send_backend_release_notify(
 +    WindowPtr window, const present_lorie_feedback_target_rec *target,
-+    CARD8 mode, CARD32 serial, uint64_t tag)
++    CARD8 mode, CARD32 serial, uint64_t tag, uint64_t deadline_us,
++    uint64_t expected_us, uint64_t opportunity_msc)
 +{
 +    present_window_priv_ptr window_priv = present_window_priv(window);
 +    present_event_ptr event;
@@ -306,6 +458,24 @@ index 849732dc880c4627ff80ae8eed6d3794d906e2d6..eddea16c6d974b1579cb536de67fc73f
 +            !(event->mask & PresentCompleteNotifyMask))
 +            continue;
 +
++        if (mode == LoriePresentBackendReleaseConsumed &&
++            deadline_us && expected_us && opportunity_msc) {
++            xPresentCompleteNotify timeline = {
++                .type = GenericEvent,
++                .extension = present_request,
++                .length = (sizeof(xPresentCompleteNotify) - 32) >> 2,
++                .evtype = PresentCompleteNotify,
++                .kind = LoriePresentCompleteKindTimeline,
++                .mode = LoriePresentTimelineModeExact,
++                .eid = event->id,
++                .window = window->drawable.id,
++                .serial = serial,
++                .ust = deadline_us,
++                .msc = expected_us,
++            };
++            WriteEventsToClient(event->client, 1, (xEvent *) &timeline);
++        }
++
 +        cn = (xPresentCompleteNotify) {
 +            .type = GenericEvent,
 +            .extension = present_request,
@@ -316,8 +486,12 @@ index 849732dc880c4627ff80ae8eed6d3794d906e2d6..eddea16c6d974b1579cb536de67fc73f
 +            .eid = event->id,
 +            .window = window->drawable.id,
 +            .serial = serial,
++            /* The preceding private event carries deadline/expected time.
++             * This event retains the ownership boundary and contributes the
++             * exact renderer-opportunity MSC used to correlate that pair. */
 +            .ust = 0,
-+            .msc = tag,
++            .msc = mode == LoriePresentBackendReleaseConsumed ?
++                   opportunity_msc : tag,
 +        };
 +        WriteEventsToClient(event->client, 1, (xEvent *) &cn);
 +        return TRUE;
@@ -326,18 +500,36 @@ index 849732dc880c4627ff80ae8eed6d3794d906e2d6..eddea16c6d974b1579cb536de67fc73f
 +    return FALSE;
 +}
 +
-@@ -249,0 +363,3 @@ present_select_input(ClientPtr client, XID eid, WindowPtr window, CARD32 mask)
+ void
+ present_send_idle_notify(WindowPtr window, CARD32 serial, PixmapPtr pixmap, struct present_fence *idle_fence)
+ {
+@@ -247,6 +383,9 @@ present_select_input(ClientPtr client, XID eid, WindowPtr window, CARD32 mask)
+     event->window = window;
+     event->id = eid;
+     event->mask = mask;
 +    event->lorie_generation = ++present_lorie_event_generation;
 +    if (!event->lorie_generation)
 +        event->lorie_generation = ++present_lorie_event_generation;
+ 
+     event->next = window_priv->events;
+     window_priv->events = event;
 diff --git a/present/present_execute.c b/present/present_execute.c
 index 68a5878be9c3f9698e4905c36965cf1e5b6efc89..0d31323eea1d7e2b431afc508bb1dc9a3c2bc6fd 100644
 --- a/present/present_execute.c
 +++ b/present/present_execute.c
-@@ -35,0 +36,2 @@ present_wait_fence_triggered(void *param)
+@@ -33,6 +33,8 @@ present_wait_fence_triggered(void *param)
+     present_vblank_ptr      vblank = param;
+     ScreenPtr               screen = vblank->screen;
+     present_screen_priv_ptr screen_priv = present_screen_priv(screen);
 +    /* lorie: disarm, or miSyncTriggerFence()'s restart-scan re-fires this callback. */
 +    present_fence_set_callback(vblank->wait_fence, NULL, NULL);
-@@ -69,0 +72,8 @@ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
+ 
+     screen_priv->re_execute(vblank);
+ }
+@@ -67,6 +69,14 @@ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
+     WindowPtr                   window = vblank->window;
+     ScreenPtr                   screen = window->drawable.pScreen;
+     present_screen_priv_ptr screen_priv = present_screen_priv(screen);
 +    /* lorie: screen_x/screen_y is dst's own (0,0) in screen coords; window.xy minus that gives the
 +     * window's offset within dst, whether dst is root, itself, or an inherited redirected ancestor. */
 +    PixmapPtr                   gpuCopyDst = screen->GetWindowPixmap(window);
@@ -346,7 +538,13 @@ index 68a5878be9c3f9698e4905c36965cf1e5b6efc89..0d31323eea1d7e2b431afc508bb1dc9a
 +    /* lorie: renderer can be connected but still unable to ever finish a pending GPU copy
 +     * (e.g. activity backgrounded, no surface) - completedSerial won't advance either way. */
 +    Bool                         gpuCopyStalled = !lorieConnectionAlive() || !lorieRendererAvailable();
-@@ -82 +92,73 @@ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
+ 
+     /* If present_flip failed, we may have to requeue for the next MSC */
+     if (vblank->exec_msc == crtc_msc + 1 &&
+@@ -79,12 +89,80 @@ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
+         return;
+     }
+ 
 -    present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
 +    /* lorie: a GPU copy was already scheduled; poll for completion instead of blocking. */
 +    if (vblank->gpu_copy_pending && !lorieGpuCopyIsDone(vblank->gpu_copy_serial) &&
@@ -421,18 +619,30 @@ index 68a5878be9c3f9698e4905c36965cf1e5b6efc89..0d31323eea1d7e2b431afc508bb1dc9a
 +         */
 +        vblank->update = NULL;
 +    }
-@@ -84,4 +165,0 @@ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
+ 
 -    /* present_copy_region sticks the region into a scratch GC,
 -     * which is then freed, freeing the region
 -     */
 -    vblank->update = NULL;
+     screen_priv->flush(window);
+ 
+     present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
 diff --git a/present/present_priv.h b/present/present_priv.h
-index 4ad729864759ce67668545299f355337540386eb..2ca1c5ca01979d7d3ad03716f249e8c527d3dbc8 100644
+index 4ad729864759ce67668545299f355337540386eb..ac32c64048cf9f5a6ffa3262682824c3980a8d4d 100644
 --- a/present/present_priv.h
 +++ b/present/present_priv.h
-@@ -26,0 +27 @@
+@@ -24,6 +24,7 @@
+ #define _PRESENT_PRIV_H_
+ 
+ #include "dix-config.h"
 +#include <stdbool.h>
-@@ -50,0 +52,12 @@
+ #include <X11/X.h>
+ #include "scrnintstr.h"
+ #include "misc.h"
+@@ -48,6 +49,20 @@
+ #define PresentWindowDestroyed (1 << 0)
+ #endif
+ 
 +/* Private Termux:X11 protocol negotiated through QueryCapabilities. */
 +#define LoriePresentCapabilityBackendRelease (1U << 27)
 +#define LoriePresentCapabilityActualFeedback (1U << 28)
@@ -440,12 +650,20 @@ index 4ad729864759ce67668545299f355337540386eb..2ca1c5ca01979d7d3ad03716f249e8c5
 +#define LoriePresentOptionActualFeedback     (1U << 31)
 +#define LoriePresentCompleteKindActual       2
 +#define LoriePresentCompleteKindBackendRelease 3
++#define LoriePresentCompleteKindTimeline     4
 +#define LoriePresentCompleteModeActual       1
 +#define LoriePresentCompleteModeUnknown      2
++#define LoriePresentTimelineModeExact         1
 +#define LoriePresentBackendReleaseConsumed   1
 +#define LoriePresentBackendReleaseRetired    2
 +
-@@ -58,0 +72,7 @@ typedef struct present_notify present_notify_rec, *present_notify_ptr;
+ extern int present_request;
+ 
+ extern DevPrivateKeyRec present_screen_private_key;
+@@ -56,6 +71,13 @@ typedef struct present_fence *present_fence_ptr;
+ 
+ typedef struct present_notify present_notify_rec, *present_notify_ptr;
+ 
 +typedef struct {
 +    XID eid;
 +    uint64_t window_generation;
@@ -453,7 +671,13 @@ index 4ad729864759ce67668545299f355337540386eb..2ca1c5ca01979d7d3ad03716f249e8c5
 +    CARD32 options;
 +} present_lorie_feedback_target_rec;
 +
-@@ -92,0 +113,10 @@ struct present_vblank {
+ struct present_notify {
+     struct xorg_list    window_list;
+     WindowPtr           window;
+@@ -90,8 +112,47 @@ struct present_vblank {
+     Bool                abort_flip;     /* aborting this flip */
+     PresentFlipReason   reason;         /* reason for which flip is not possible */
+     Bool                has_suboptimal; /* whether client can support SuboptimalCopy mode */
 +
 +    /* lorie: set when present_execute_copy offloaded the copy to the renderer's GPU context;
 +     * the vblank stays queued until the copy is acknowledged done. */
@@ -464,7 +688,8 @@ index 4ad729864759ce67668545299f355337540386eb..2ca1c5ca01979d7d3ad03716f249e8c5
 +    present_lorie_feedback_target_rec lorie_feedback;
 +    Bool                lorie_feedback_handed_off;
 +    Bool                lorie_feedback_terminal_sent;
-@@ -94,0 +125,29 @@ struct present_vblank {
+ };
+ 
 +/* lorie: hooks implemented in lorie/InitOutput.c, used by present_execute_copy() to offload the
 + * pixmap->dst copy (dst being whatever GetWindowPixmap(window) is - root, or a Composite-redirected
 + * window's own backing pixmap) to the renderer's GPU context instead of a CPU CopyArea. */
@@ -494,19 +719,49 @@ index 4ad729864759ce67668545299f355337540386eb..2ca1c5ca01979d7d3ad03716f249e8c5
 +/* lorie: implemented in present_scmd.c; re-executes any vblank whose GPU copy has finished. */
 +extern void lorieRecheckGpuCopies(void);
 +
-@@ -132 +191,2 @@ typedef int (*present_priv_pixmap_ptr)(WindowPtr window,
+ typedef struct present_screen_priv present_screen_priv_rec, *present_screen_priv_ptr;
+ typedef struct present_window_priv present_window_priv_rec, *present_window_priv_ptr;
+ 
+@@ -129,7 +190,8 @@ typedef int (*present_priv_pixmap_ptr)(WindowPtr window,
+                                        uint64_t divisor,
+                                        uint64_t remainder,
+                                        present_notify_ptr notifies,
 -                                       int num_notifies);
 +                                       int num_notifies,
 +                                       const present_lorie_feedback_target_rec *lorie_feedback);
-@@ -214,0 +275 @@ typedef struct present_event {
+ 
+ typedef int (*present_priv_queue_vblank_ptr)(ScreenPtr screen,
+                                              WindowPtr window,
+@@ -212,6 +274,7 @@ typedef struct present_event {
+     WindowPtr window;
+     XID id;
+     int mask;
 +    uint64_t lorie_generation;
-@@ -224,0 +286 @@ struct present_window_priv {
+ } present_event_rec;
+ 
+ struct present_window_priv {
+@@ -222,6 +285,7 @@ struct present_window_priv {
+     uint64_t               msc;         /* Last reported MSC from the current crtc */
+     struct xorg_list       vblank;
+     struct xorg_list       notifies;
 +    uint64_t               lorie_generation;
-@@ -298 +360,2 @@ present_pixmap(WindowPtr window,
+ };
+ 
+ #define PresentCrtcNeverSet     ((RRCrtcPtr) 1)
+@@ -295,7 +359,8 @@ present_pixmap(WindowPtr window,
+                uint64_t divisor,
+                uint64_t remainder,
+                present_notify_ptr notifies,
 -               int num_notifies);
 +               int num_notifies,
 +               const present_lorie_feedback_target_rec *lorie_feedback);
-@@ -319,0 +383,15 @@ present_send_complete_notify(WindowPtr window, CARD8 kind, CARD8 mode, CARD32 se
+ 
+ int
+ present_notify_msc(WindowPtr window,
+@@ -317,6 +382,22 @@ present_send_config_notify(WindowPtr window, int x, int y, int w, int h, int bw,
+ void
+ present_send_complete_notify(WindowPtr window, CARD8 kind, CARD8 mode, CARD32 serial, uint64_t ust, uint64_t msc);
+ 
 +Bool
 +present_lorie_get_feedback_target(WindowPtr window, ClientPtr client,
 +                                  present_lorie_feedback_target_rec *target);
@@ -520,29 +775,57 @@ index 4ad729864759ce67668545299f355337540386eb..2ca1c5ca01979d7d3ad03716f249e8c5
 +Bool
 +present_lorie_send_backend_release_notify(
 +    WindowPtr window, const present_lorie_feedback_target_rec *target,
-+    CARD8 mode, CARD32 serial, uint64_t tag);
++    CARD8 mode, CARD32 serial, uint64_t tag, uint64_t deadline_us,
++    uint64_t expected_us, uint64_t opportunity_msc);
 +
-@@ -472 +550,2 @@ present_vblank_init(present_vblank_ptr vblank,
+ void
+ present_send_idle_notify(WindowPtr window, CARD32 serial, PixmapPtr pixmap, present_fence_ptr idle_fence);
+ 
+@@ -469,7 +550,8 @@ present_vblank_init(present_vblank_ptr vblank,
+                     present_notify_ptr notifies,
+                     int num_notifies,
+                     uint64_t target_msc,
 -                    uint64_t crtc_msc);
 +                    uint64_t crtc_msc,
 +                    const present_lorie_feedback_target_rec *lorie_feedback);
-@@ -490 +569,2 @@ present_vblank_create(WindowPtr window,
+ 
+ present_vblank_ptr
+ present_vblank_create(WindowPtr window,
+@@ -487,7 +569,8 @@ present_vblank_create(WindowPtr window,
+                       present_notify_ptr notifies,
+                       int num_notifies,
+                       uint64_t target_msc,
 -                      uint64_t crtc_msc);
 +                      uint64_t crtc_msc,
 +                      const present_lorie_feedback_target_rec *lorie_feedback);
+ 
+ void
+ present_vblank_scrap(present_vblank_ptr vblank);
 diff --git a/present/present_request.c b/present/present_request.c
 index f3e5679b5d1c182d2a0e89b2a27506a000e7fdb7..c02a22994bf3892672d1d17921d3a8602e4ba526 100644
 --- a/present/present_request.c
 +++ b/present/present_request.c
-@@ -94,0 +95,2 @@ proc_present_pixmap(ClientPtr client)
+@@ -92,6 +92,8 @@ proc_present_pixmap(ClientPtr client)
+     int                 ret;
+     int                 nnotifies;
+     present_notify_ptr  notifies = NULL;
 +    present_lorie_feedback_target_rec lorie_feedback = { 0 };
 +    const present_lorie_feedback_target_rec *lorie_feedback_ptr = NULL;
-@@ -115 +117,3 @@ proc_present_pixmap(ClientPtr client)
+ 
+     REQUEST_AT_LEAST_SIZE(xPresentPixmapReq);
+     ret = dixLookupWindow(&window, stuff->window, client, DixWriteAccess);
+@@ -112,11 +114,35 @@ proc_present_pixmap(ClientPtr client)
+     VERIFY_FENCE_OR_NONE(wait_fence, stuff->wait_fence, client, DixReadAccess);
+     VERIFY_FENCE_OR_NONE(idle_fence, stuff->idle_fence, client, DixWriteAccess);
+ 
 -    if (stuff->options & ~(PresentAllOptions)) {
 +    if (stuff->options & ~(PresentAllOptions |
 +                           LoriePresentOptionBackendRelease |
 +                           LoriePresentOptionActualFeedback)) {
-@@ -119,0 +124,22 @@ proc_present_pixmap(ClientPtr client)
+         client->errorValue = stuff->options;
+         return BadValue;
+     }
+ 
 +    if (stuff->options & (LoriePresentOptionBackendRelease |
 +                          LoriePresentOptionActualFeedback)) {
 +        RRCrtcPtr capability_crtc = target_crtc ? target_crtc :
@@ -565,15 +848,27 @@ index f3e5679b5d1c182d2a0e89b2a27506a000e7fdb7..c02a22994bf3892672d1d17921d3a860
 +        lorie_feedback_ptr = &lorie_feedback;
 +    }
 +
-@@ -149 +175,2 @@ proc_present_pixmap(ClientPtr client)
+     /*
+      * Check to see if remainder is sane
+      */
+@@ -146,7 +172,8 @@ proc_present_pixmap(ClientPtr client)
+     ret = present_pixmap(window, pixmap, stuff->serial, valid, update,
+                          stuff->x_off, stuff->y_off, target_crtc,
+                          wait_fence, idle_fence, stuff->options,
 -                         stuff->target_msc, stuff->divisor, stuff->remainder, notifies, nnotifies);
 +                         stuff->target_msc, stuff->divisor, stuff->remainder,
 +                         notifies, nnotifies, lorie_feedback_ptr);
+     if (ret != Success)
+         present_destroy_notifies(notifies, nnotifies);
+     return ret;
 diff --git a/present/present_scmd.c b/present/present_scmd.c
 index 239055bc10d8c934555356c4213cda37dbff711e..a7dfd61f66ed4ad741965133f40f38558ae38faf 100644
 --- a/present/present_scmd.c
 +++ b/present/present_scmd.c
-@@ -254,0 +255,15 @@ present_flip_try_ready(ScreenPtr screen)
+@@ -252,6 +252,21 @@ present_flip_try_ready(ScreenPtr screen)
+     }
+ }
+ 
 +/* lorie: called when the renderer notifies that a GPU copy batch finished, or that it just lost
 + * its surface, instead of waiting for the next vblank poll. _safe iteration since
 + * present_re_execute() may destroy the vblank. */
@@ -589,7 +884,13 @@ index 239055bc10d8c934555356c4213cda37dbff711e..a7dfd61f66ed4ad741965133f40f3855
 +    }
 +}
 +
-@@ -601,0 +617,14 @@ present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
+ static void
+ present_flip_idle(ScreenPtr screen)
+ {
+@@ -599,6 +614,20 @@ present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
+                     damage = &window->clipList;
+ 
+                 DamageDamageRegion(&vblank->window->drawable, damage);
 +                {
 +                    uint64_t lorie_present_tag = loriePreparePresentTag(
 +                        vblank->window, (*screen->GetScreenPixmap)(screen),
@@ -604,11 +905,23 @@ index 239055bc10d8c934555356c4213cda37dbff711e..a7dfd61f66ed4ad741965133f40f3855
 +                    if (lorie_present_tag)
 +                        vblank->lorie_feedback_handed_off = TRUE;
 +                }
-@@ -682 +711,2 @@ present_scmd_pixmap(WindowPtr window,
+                 return;
+             }
+ 
+@@ -679,7 +708,8 @@ present_scmd_pixmap(WindowPtr window,
+                     uint64_t divisor,
+                     uint64_t remainder,
+                     present_notify_ptr notifies,
 -                    int num_notifies)
 +                    int num_notifies,
 +                    const present_lorie_feedback_target_rec *lorie_feedback)
-@@ -723,0 +754,25 @@ present_scmd_pixmap(WindowPtr window,
+ {
+     uint64_t                    ust = 0;
+     uint64_t                    target_msc;
+@@ -721,6 +751,31 @@ present_scmd_pixmap(WindowPtr window,
+                                         remainder,
+                                         options);
+ 
 +    /* A paced client may deliberately keep one future submission queued.
 +     * If an earlier target became stale before the server processed it,
 +     * present_get_target_msc() moves it to the next MSC.  Applying the same
@@ -634,25 +947,49 @@ index 239055bc10d8c934555356c4213cda37dbff711e..a7dfd61f66ed4ad741965133f40f3855
 +        }
 +    }
 +
-@@ -763 +818,2 @@ present_scmd_pixmap(WindowPtr window,
+     /*
+      * Look for a matching presentation already on the list and
+      * don't bother doing the previous one if this one will overwrite it
+@@ -760,7 +815,8 @@ present_scmd_pixmap(WindowPtr window,
+                                    notifies,
+                                    num_notifies,
+                                    target_msc,
 -                                   crtc_msc);
 +                                   crtc_msc,
 +                                   lorie_feedback);
+ 
+     if (!vblank)
+         return BadAlloc;
 diff --git a/present/present_screen.c b/present/present_screen.c
 index 2c29aafd23509143b491cc9c6209234faa026b33..42c57618667f0ae00fb161a19276f914fbe60651 100644
 --- a/present/present_screen.c
 +++ b/present/present_screen.c
-@@ -27,0 +28 @@ DevPrivateKeyRec present_window_private_key;
+@@ -25,6 +25,7 @@
+ int present_request;
+ DevPrivateKeyRec present_screen_private_key;
+ DevPrivateKeyRec present_window_private_key;
 +static uint64_t present_lorie_window_generation;
-@@ -46,0 +48,3 @@ present_get_window_priv(WindowPtr window, Bool create)
+ 
+ /*
+  * Get a pointer to a present window private, creating if necessary
+@@ -44,6 +45,9 @@ present_get_window_priv(WindowPtr window, Bool create)
+ 
+     window_priv->window = window;
+     window_priv->crtc = PresentCrtcNeverSet;
 +    window_priv->lorie_generation = ++present_lorie_window_generation;
 +    if (!window_priv->lorie_generation)
 +        window_priv->lorie_generation = ++present_lorie_window_generation;
+     dixSetPrivate(&window->devPrivates, &present_window_private_key, window_priv);
+     return window_priv;
+ }
 diff --git a/present/present_vblank.c b/present/present_vblank.c
-index a9f17d4b2be374257b44199959c5ae1beb2d3972..7d3ac87dcd51ac84ae1e67caf7db7a805791ed5d 100644
+index a9f17d4b2be374257b44199959c5ae1beb2d3972..b4cc3bab0f2ae2f96e601b6fdf3be0ca001d887c 100644
 --- a/present/present_vblank.c
 +++ b/present/present_vblank.c
-@@ -24,0 +25,25 @@
+@@ -22,6 +22,31 @@
+ 
+ #include "present_priv.h"
+ 
 +static void
 +present_lorie_retire_feedback_unknown(present_vblank_ptr vblank)
 +{
@@ -673,26 +1010,56 @@ index a9f17d4b2be374257b44199959c5ae1beb2d3972..7d3ac87dcd51ac84ae1e67caf7db7a80
 +            present_lorie_send_backend_release_notify(
 +                vblank->window, &vblank->lorie_feedback,
 +                LoriePresentBackendReleaseRetired,
-+                vblank->serial, 0);
++                vblank->serial, 0, 0, 0, 0);
 +    }
 +    vblank->lorie_feedback_terminal_sent = TRUE;
 +}
 +
-@@ -63 +88,2 @@ present_vblank_init(present_vblank_ptr vblank,
+ void
+ present_vblank_notify(present_vblank_ptr vblank, CARD8 kind, CARD8 mode, uint64_t ust, uint64_t crtc_msc)
+ {
+@@ -60,7 +85,8 @@ present_vblank_init(present_vblank_ptr vblank,
+                     present_notify_ptr notifies,
+                     int num_notifies,
+                     uint64_t target_msc,
 -                    uint64_t crtc_msc)
 +                    uint64_t crtc_msc,
 +                    const present_lorie_feedback_target_rec *lorie_feedback)
-@@ -108,0 +135,2 @@ present_vblank_init(present_vblank_ptr vblank,
+ {
+     ScreenPtr                   screen = window->drawable.pScreen;
+     present_window_priv_ptr     window_priv = present_get_window_priv(window, TRUE);
+@@ -106,6 +132,8 @@ present_vblank_init(present_vblank_ptr vblank,
+     vblank->notifies = notifies;
+     vblank->num_notifies = num_notifies;
+     vblank->has_suboptimal = (options & PresentOptionSuboptimal);
 +    if (lorie_feedback)
 +        vblank->lorie_feedback = *lorie_feedback;
-@@ -166 +194,2 @@ present_vblank_create(WindowPtr window,
+ 
+     if (pixmap != NULL &&
+         !(options & PresentOptionCopy) &&
+@@ -163,7 +191,8 @@ present_vblank_create(WindowPtr window,
+                       present_notify_ptr notifies,
+                       int num_notifies,
+                       uint64_t target_msc,
 -                      uint64_t crtc_msc)
 +                      uint64_t crtc_msc,
 +                      const present_lorie_feedback_target_rec *lorie_feedback)
-@@ -176 +205 @@ present_vblank_create(WindowPtr window,
+ {
+     present_vblank_ptr vblank = calloc(1, sizeof(present_vblank_rec));
+ 
+@@ -173,7 +202,7 @@ present_vblank_create(WindowPtr window,
+     if (present_vblank_init(vblank, window, pixmap, serial, valid, update,
+                             x_off, y_off, target_crtc, wait_fence, idle_fence,
+                             options, capabilities, notifies, num_notifies,
 -                            target_msc, crtc_msc))
 +                            target_msc, crtc_msc, lorie_feedback))
-@@ -190,0 +220,10 @@ present_vblank_scrap(present_vblank_ptr vblank)
+         return vblank;
+ 
+     present_vblank_destroy(vblank);
+@@ -188,6 +217,16 @@ present_vblank_scrap(present_vblank_ptr vblank)
+                   vblank->pixmap->drawable.id, vblank->window->drawable.id,
+                   vblank->crtc));
+ 
 +    present_lorie_retire_feedback_unknown(vblank);
 +
 +    /* lorie: an offloaded copy into vblank->pixmap may still be in flight - ack it now, while
@@ -703,7 +1070,13 @@ index a9f17d4b2be374257b44199959c5ae1beb2d3972..7d3ac87dcd51ac84ae1e67caf7db7a80
 +        vblank->gpu_copy_pending = FALSE;
 +    }
 +
-@@ -202,0 +242,9 @@ present_vblank_destroy(present_vblank_ptr vblank)
+     present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
+     present_fence_destroy(vblank->idle_fence);
+     dixDestroyPixmap(vblank->pixmap, vblank->pixmap->drawable.id);
+@@ -200,6 +239,15 @@ present_vblank_scrap(present_vblank_ptr vblank)
+ void
+ present_vblank_destroy(present_vblank_ptr vblank)
+ {
 +    present_lorie_retire_feedback_unknown(vblank);
 +
 +    /* lorie: same as in present_vblank_scrap() - must run before vblank->pixmap is dropped below,
@@ -713,15 +1086,27 @@ index a9f17d4b2be374257b44199959c5ae1beb2d3972..7d3ac87dcd51ac84ae1e67caf7db7a80
 +        vblank->gpu_copy_pending = FALSE;
 +    }
 +
+     /* Remove vblank from window and screen lists */
+     xorg_list_del(&vblank->window_list);
+     /* Also make sure vblank is removed from event queue (wnmd) */
 diff --git a/xkb/ddxLoad.c b/xkb/ddxLoad.c
 index f9b7b06d901813d30fa4d0c2a39387039c805c6f..f4b2aeddcc380fb5f621dabc959cc326b524faec 100644
 --- a/xkb/ddxLoad.c
 +++ b/xkb/ddxLoad.c
-@@ -58,0 +59,3 @@ THE USE OR PERFORMANCE OF THIS SOFTWARE.
+@@ -56,6 +56,9 @@ THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ #define PATHSEPARATOR "/"
+ #endif
+ 
 +char* xkbcomp_argv[16] = {0};
 +int xkbcomp_argc = 0;
 +
-@@ -154,0 +158,19 @@ RunXkbComp(xkbcomp_buffer_callback callback, void *userdata)
+ static unsigned
+ LoadXKM(unsigned want, unsigned need, const char *keymap, XkbDescPtr *xkbRtrn);
+ 
+@@ -152,6 +155,25 @@ RunXkbComp(xkbcomp_buffer_callback callback, void *userdata)
+                  xkm_output_dir, keymap) == -1)
+         buf = NULL;
+ 
 +    char buf2[256];
 +    char buf3[256];
 +    sprintf(buf2, "-R%s", XkbBaseDirectory);
@@ -741,3 +1126,6 @@ index f9b7b06d901813d30fa4d0c2a39387039c805c6f..f4b2aeddcc380fb5f621dabc959cc326
 +    xkbcomp_argv[12] = buf3;
 +    xkbcomp_argc = 13;
 +
+     free(xkbbasedirflag);
+ 
+     if (!buf) {

@@ -147,6 +147,36 @@ static bool readPublishedPresentTag(const lorie_shared_server_state* state,
     return out->tag != 0;
 }
 
+/* Snapshot the opportunity before rendering starts.  Reading it later, at
+ * backend release, could associate a frame with a newer Choreographer
+ * callback that arrived while the GPU was drawing it. */
+static bool readFrameTimeline(const lorie_shared_server_state* state,
+                              LorieFrameTimeline* out) {
+    uint32_t before, after;
+
+    if (!state || !out)
+        return false;
+
+    for (;;) {
+        before = __atomic_load_n(&state->latestFrameTimeline.version,
+                                 __ATOMIC_ACQUIRE);
+        if (before & 1)
+            continue;
+        out->deadlineUs = __atomic_load_n(
+            &state->latestFrameTimeline.deadlineUs, __ATOMIC_RELAXED);
+        out->expectedUs = __atomic_load_n(
+            &state->latestFrameTimeline.expectedUs, __ATOMIC_RELAXED);
+        out->opportunityMsc = __atomic_load_n(
+            &state->latestFrameTimeline.opportunityMsc, __ATOMIC_RELAXED);
+        after = __atomic_load_n(&state->latestFrameTimeline.version,
+                                __ATOMIC_ACQUIRE);
+        if (before == after && !(after & 1))
+            break;
+    }
+
+    return out->deadlineUs && out->expectedUs && out->opportunityMsc;
+}
+
 /* DEBUG: Stage-E validation only.  This deliberately does not advertise a
  * direct-presentation capability or alter the production renderer.  A buffer
  * which can be imported for sampling is not necessarily a legal render
@@ -383,7 +413,8 @@ void Renderer::notifyPresentFeedback(const PendingPresentFeedback& pending,
 }
 
 void Renderer::notifyPresentBackendRelease(
-    const LoriePresentTag& presentTag, uint8_t mode) const {
+    const LoriePresentTag& presentTag, uint8_t mode,
+    const LorieFrameTimeline* timeline) const {
     if (!connFdPtr || *connFdPtr == -1 || !presentTag.tag ||
         !(presentTag.options & LORIE_PRESENT_OPTION_BACKEND_RELEASE))
         return;
@@ -392,6 +423,11 @@ void Renderer::notifyPresentBackendRelease(
     event.presentBackendRelease.t = EVENT_PRESENT_BACKEND_RELEASE;
     event.presentBackendRelease.mode = mode;
     event.presentBackendRelease.presentTag = presentTag;
+    if (mode == LORIE_PRESENT_BACKEND_RELEASE_CONSUMED && timeline) {
+        event.presentBackendRelease.deadlineUs = timeline->deadlineUs;
+        event.presentBackendRelease.expectedUs = timeline->expectedUs;
+        event.presentBackendRelease.opportunityMsc = timeline->opportunityMsc;
+    }
     write(*connFdPtr, &event, sizeof(event));
 }
 
@@ -1431,6 +1467,8 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     uint32_t renderingOpportunity = state ?
         __atomic_load_n(&state->frameOpportunitySequence,
                         __ATOMIC_ACQUIRE) : 0;
+    LorieFrameTimeline renderingTimeline{};
+    bool renderingTimelineValid = readFrameTimeline(state, &renderingTimeline);
 
     // Early returns below skip the applyPendingGpuCopiesLocked() call further down, which would
     // stall copies queued for windows unrelated to root while root itself isn't ready yet.
@@ -1671,7 +1709,8 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
      * presents the renderer output; those outcomes remain actual-feedback
      * events. */
     notifyPresentBackendRelease(
-        framePresentTag, LORIE_PRESENT_BACKEND_RELEASE_CONSUMED);
+        framePresentTag, LORIE_PRESENT_BACKEND_RELEASE_CONSUMED,
+        renderingTimelineValid ? &renderingTimeline : nullptr);
 
     EGLuint64KHR eglFrameId = 0;
     bool trackPresent = presentFeedbackSurfaceEnabled &&
