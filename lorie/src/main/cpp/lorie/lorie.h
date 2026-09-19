@@ -89,7 +89,25 @@ typedef struct __attribute__((aligned(8))) {
     uint64_t expectedUs;
     uint64_t opportunityUs;
     uint64_t opportunityMsc;
+    int64_t vsyncId;
 } LorieFrameTimeline;
+
+enum {
+    LORIE_SURFACECONTROL_REQUEST_NONE = 0,
+    LORIE_SURFACECONTROL_REQUEST_FLIP = 1,
+    LORIE_SURFACECONTROL_REQUEST_UNFLIP = 2,
+};
+
+/* DEBUG: one request is sufficient because Present permits only one pending
+ * flip per screen.  The X server is the sole writer; the Android renderer is
+ * the sole reader.  Producer completion remains PR96's responsibility. */
+typedef struct __attribute__((aligned(8))) {
+    volatile uint32_t version;
+    uint32_t kind;
+    uint64_t eventId;
+    uint64_t bufferId;
+    uint64_t targetMsc;
+} LorieSurfaceControlRequest;
 
 #ifdef __cplusplus
 extern "C" {
@@ -119,6 +137,8 @@ void lorieHandlePresentBackendRelease(uint8_t mode,
                                       uint64_t expected_us,
                                       uint64_t opportunity_us,
                                       uint64_t opportunity_msc);
+void lorieHandleSurfaceControlComplete(uint64_t event_id,
+                                       int64_t observed_present_ns);
 void lorieChoreographerStart(AChoreographer *choreographer);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
@@ -201,6 +221,7 @@ typedef enum {
     EVENT_SYNC,
     EVENT_SYNC_REPLY,
     EVENT_PRESENT_BACKEND_RELEASE,
+    EVENT_SURFACE_CONTROL_COMPLETE,
 } eventType;
 
 typedef union {
@@ -284,6 +305,12 @@ typedef union {
         uint8_t t;
         uint32_t serial;
     } sync;
+    struct {
+        uint8_t t;
+        uint8_t reserved[7];
+        uint64_t eventId;
+        int64_t observedPresentNs;
+    } surfaceControlComplete;
 } lorieEvent;
 
 typedef struct { int16_t x1, y1, x2, y2; } LorieGpuCopyRect;
@@ -347,7 +374,16 @@ struct lorie_shared_server_state {
         uint64_t expectedUs;
         uint64_t opportunityUs;
         uint64_t opportunityMsc;
+        int64_t vsyncId;
     } latestFrameTimeline;
+
+    /* DEBUG: opt-in SurfaceControl handoff.  Availability and active are
+     * renderer-owned observations; request is X-server-owned. */
+    volatile uint8_t surfaceControlEnabled;
+    volatile uint8_t surfaceControlAvailable;
+    volatile uint8_t surfaceControlActive;
+    volatile uint8_t surfaceControlEligible;
+    LorieSurfaceControlRequest surfaceControlRequest;
 
     /* ID of root window texture to be drawn. */
     uint64_t rootWindowTextureID;
@@ -437,6 +473,8 @@ struct lorie_shared_server_state {
 #include <EGL/eglext.h>
 #include <GLES2/gl2.h>
 #include "list.h"
+
+struct SurfaceControlBridge;
 
 struct Renderer {
     static constexpr uint32_t PRESENT_FEEDBACK_QUEUE_CAPACITY = 32;
@@ -535,6 +573,12 @@ struct Renderer {
     bool presentFeedbackExtensionAvailable = false;
     bool presentFeedbackSurfaceEnabled = false;
 
+    /* DEBUG: API-29+ opt-in presentation transport.  The bridge owns its
+     * callback worker and may outlive a retired Android window until all
+     * SurfaceFlinger release fences have signalled. */
+    SurfaceControlBridge* surfaceControlBridge = nullptr;
+    uint32_t lastSurfaceControlRequestVersion = 0;
+
     volatile int* connFdPtr = nullptr;
 
     void init(JNIEnv* env, jobject thiz);
@@ -570,6 +614,8 @@ struct Renderer {
     void notifyGpuCopyDone() const;
     void initializePresentFeedbackApi();
     void configurePresentFeedbackSurface();
+    void configureSurfaceControl();
+    void stopSurfaceControl(uint64_t completionEventId = 0);
     void resetPresentFeedback(bool notifyUnknown);
     void pollPresentFeedback();
     void retirePresentTagUnknown(const LoriePresentTag& presentTag,

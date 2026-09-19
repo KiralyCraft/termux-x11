@@ -21,10 +21,14 @@
 #include <GLES2/gl2ext.h>
 #include <android/native_window_jni.h>
 #include <android/log.h>
+#include <android/surface_control.h>
 #include <media/NdkImageReader.h>
 #include <dlfcn.h>
 #include <cmath>
 #include <cstring>
+#include <cerrno>
+#include <new>
+#include <poll.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -53,6 +57,299 @@ static int64_t monotonicTimeNs() {
     struct timespec now{};
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (int64_t) now.tv_sec * 1000000000LL + now.tv_nsec;
+}
+
+/* DEBUG: SurfaceControl is resolved at runtime.  Merely linking libandroid
+ * must not make the API-24 minimum depend on API-29 symbols. */
+struct SurfaceControlApi {
+    decltype(&ASurfaceControl_createFromWindow) createFromWindow = nullptr;
+    decltype(&ASurfaceControl_release) release = nullptr;
+    decltype(&ASurfaceTransaction_create) transactionCreate = nullptr;
+    decltype(&ASurfaceTransaction_delete) transactionDelete = nullptr;
+    decltype(&ASurfaceTransaction_apply) transactionApply = nullptr;
+    decltype(&ASurfaceTransaction_setOnComplete) setOnComplete = nullptr;
+    decltype(&ASurfaceTransaction_reparent) reparent = nullptr;
+    decltype(&ASurfaceTransaction_setVisibility) setVisibility = nullptr;
+    decltype(&ASurfaceTransaction_setZOrder) setZOrder = nullptr;
+    decltype(&ASurfaceTransaction_setBuffer) setBuffer = nullptr;
+    decltype(&ASurfaceTransaction_setGeometry) setGeometry = nullptr;
+    decltype(&ASurfaceTransaction_setBufferTransparency) setTransparency = nullptr;
+    decltype(&ASurfaceTransaction_setDamageRegion) setDamageRegion = nullptr;
+    decltype(&ASurfaceTransaction_setDesiredPresentTime) setDesiredPresentTime = nullptr;
+    decltype(&ASurfaceTransaction_setBufferDataSpace) setDataSpace = nullptr;
+    decltype(&ASurfaceTransactionStats_getPresentFenceFd) getPresentFence = nullptr;
+    decltype(&ASurfaceTransactionStats_getPreviousReleaseFenceFd) getPreviousReleaseFence = nullptr;
+    decltype(&ASurfaceTransaction_setEnableBackPressure) setBackPressure = nullptr;
+    decltype(&ASurfaceTransaction_setFrameTimeline) setFrameTimeline = nullptr;
+    bool baseAvailable = false;
+};
+
+static SurfaceControlApi surfaceControlApi;
+static pthread_once_t surfaceControlApiOnce = PTHREAD_ONCE_INIT;
+
+static void initializeSurfaceControlApi() {
+#define LOAD_SC(member, symbol) \
+    surfaceControlApi.member = reinterpret_cast<decltype(surfaceControlApi.member)>(dlsym(RTLD_DEFAULT, symbol))
+    LOAD_SC(createFromWindow, "ASurfaceControl_createFromWindow");
+    LOAD_SC(release, "ASurfaceControl_release");
+    LOAD_SC(transactionCreate, "ASurfaceTransaction_create");
+    LOAD_SC(transactionDelete, "ASurfaceTransaction_delete");
+    LOAD_SC(transactionApply, "ASurfaceTransaction_apply");
+    LOAD_SC(setOnComplete, "ASurfaceTransaction_setOnComplete");
+    LOAD_SC(reparent, "ASurfaceTransaction_reparent");
+    LOAD_SC(setVisibility, "ASurfaceTransaction_setVisibility");
+    LOAD_SC(setZOrder, "ASurfaceTransaction_setZOrder");
+    LOAD_SC(setBuffer, "ASurfaceTransaction_setBuffer");
+    LOAD_SC(setGeometry, "ASurfaceTransaction_setGeometry");
+    LOAD_SC(setTransparency, "ASurfaceTransaction_setBufferTransparency");
+    LOAD_SC(setDamageRegion, "ASurfaceTransaction_setDamageRegion");
+    LOAD_SC(setDesiredPresentTime, "ASurfaceTransaction_setDesiredPresentTime");
+    LOAD_SC(setDataSpace, "ASurfaceTransaction_setBufferDataSpace");
+    LOAD_SC(getPresentFence, "ASurfaceTransactionStats_getPresentFenceFd");
+    LOAD_SC(getPreviousReleaseFence, "ASurfaceTransactionStats_getPreviousReleaseFenceFd");
+    LOAD_SC(setBackPressure, "ASurfaceTransaction_setEnableBackPressure");
+    LOAD_SC(setFrameTimeline, "ASurfaceTransaction_setFrameTimeline");
+#undef LOAD_SC
+    surfaceControlApi.baseAvailable = surfaceControlApi.createFromWindow &&
+        surfaceControlApi.release && surfaceControlApi.transactionCreate &&
+        surfaceControlApi.transactionDelete && surfaceControlApi.transactionApply &&
+        surfaceControlApi.setOnComplete && surfaceControlApi.reparent &&
+        surfaceControlApi.setVisibility && surfaceControlApi.setZOrder &&
+        surfaceControlApi.setBuffer && surfaceControlApi.setGeometry &&
+        surfaceControlApi.setTransparency && surfaceControlApi.setDamageRegion &&
+        surfaceControlApi.setDesiredPresentTime && surfaceControlApi.setDataSpace &&
+        surfaceControlApi.getPresentFence &&
+        surfaceControlApi.getPreviousReleaseFence;
+}
+
+static bool writeEventNoSignal(int fd, const lorieEvent& event) {
+    const uint8_t* bytes = reinterpret_cast<const uint8_t*>(&event);
+    size_t left = sizeof(event);
+
+    while (left) {
+        ssize_t written = send(fd, bytes, left, MSG_NOSIGNAL);
+        if (written > 0) {
+            bytes += written;
+            left -= (size_t) written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool waitAndCloseFence(int fd) {
+    if (fd < 0)
+        return true;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int result;
+    do {
+        result = poll(&pfd, 1, -1);
+    } while (result < 0 && errno == EINTR);
+    bool complete = result > 0 && (pfd.revents & POLLIN) &&
+        !(pfd.revents & (POLLERR | POLLNVAL));
+    close(fd);
+    return complete;
+}
+
+struct SurfaceControlBridge {
+    static constexpr uint32_t SLOT_COUNT = 8;
+
+    struct Slot {
+        SurfaceControlBridge* bridge = nullptr;
+        uint8_t state = 0; /* 0 free, 1 callback pending, 2 ready, 3 worker */
+        uint64_t sequence = 0;
+        uint64_t eventId = 0;
+        int socketFd = -1;
+        int presentFenceFd = -1;
+        int previousReleaseFenceFd = -1;
+        int64_t submitNs = 0;
+        int64_t callbackNs = 0;
+        LoriePresentTag presentTag{};
+        LorieFrameTimeline timeline{};
+        bool timelineValid = false;
+        bool reportDirectFeedback = false;
+    } slots[SLOT_COUNT]{};
+
+    pthread_mutex_t lock{};
+    pthread_cond_t cond{};
+    pthread_t worker{};
+    ASurfaceControl* control = nullptr;
+    uint64_t nextSequence = 1;
+    uint64_t workerSequence = 1;
+    uint32_t pending = 0;
+    uint32_t generation = 0;
+    bool stopping = false;
+};
+
+static void surfaceControlOnComplete(void* context,
+                                     ASurfaceTransactionStats* stats) {
+    auto* slot = static_cast<SurfaceControlBridge::Slot*>(context);
+    SurfaceControlBridge* bridge = slot ? slot->bridge : nullptr;
+    if (!bridge)
+        return;
+
+    int presentFence = surfaceControlApi.getPresentFence(stats);
+    int previousReleaseFence =
+        surfaceControlApi.getPreviousReleaseFence(stats, bridge->control);
+    int64_t callbackNs = monotonicTimeNs();
+
+    pthread_mutex_lock(&bridge->lock);
+    if (slot->state == 1) {
+        slot->presentFenceFd = presentFence;
+        slot->previousReleaseFenceFd = previousReleaseFence;
+        slot->callbackNs = callbackNs;
+        slot->state = 2;
+        pthread_cond_signal(&bridge->cond);
+        presentFence = previousReleaseFence = -1;
+    }
+    pthread_mutex_unlock(&bridge->lock);
+    if (presentFence >= 0)
+        close(presentFence);
+    if (previousReleaseFence >= 0 && previousReleaseFence != presentFence)
+        close(previousReleaseFence);
+}
+
+static SurfaceControlBridge::Slot* reserveSurfaceControlSlot(
+    SurfaceControlBridge* bridge, int connFd, uint64_t eventId,
+    const LoriePresentTag* presentTag, const LorieFrameTimeline* timeline,
+    bool reportDirectFeedback) {
+    int socketFd = connFd >= 0 ? dup(connFd) : -1;
+    if (socketFd < 0 && (eventId || presentTag))
+        return nullptr;
+
+    pthread_mutex_lock(&bridge->lock);
+    SurfaceControlBridge::Slot* slot = nullptr;
+    if (!bridge->stopping) {
+        for (auto& candidate : bridge->slots) {
+            if (!candidate.state) {
+                slot = &candidate;
+                break;
+            }
+        }
+    }
+    if (slot) {
+        *slot = {};
+        slot->bridge = bridge;
+        slot->state = 1;
+        slot->sequence = bridge->nextSequence++;
+        slot->eventId = eventId;
+        slot->socketFd = socketFd;
+        slot->submitNs = monotonicTimeNs();
+        if (presentTag)
+            slot->presentTag = *presentTag;
+        if (timeline) {
+            slot->timeline = *timeline;
+            slot->timelineValid = true;
+        }
+        slot->reportDirectFeedback = reportDirectFeedback;
+        bridge->pending++;
+        socketFd = -1;
+    }
+    pthread_mutex_unlock(&bridge->lock);
+    if (socketFd >= 0)
+        close(socketFd);
+    return slot;
+}
+
+static void* surfaceControlCompletionWorker(void* opaque) {
+    auto* bridge = static_cast<SurfaceControlBridge*>(opaque);
+    pthread_setname_np(pthread_self(), "LorieSurfaceCtl");
+
+    for (;;) {
+        pthread_mutex_lock(&bridge->lock);
+        SurfaceControlBridge::Slot* slot = nullptr;
+        while (!slot) {
+            for (auto& candidate : bridge->slots) {
+                if (candidate.state == 2 &&
+                    candidate.sequence == bridge->workerSequence) {
+                    slot = &candidate;
+                    slot->state = 3;
+                    break;
+                }
+            }
+            if (slot)
+                break;
+            if (bridge->stopping && !bridge->pending) {
+                pthread_mutex_unlock(&bridge->lock);
+                surfaceControlApi.release(bridge->control);
+                pthread_cond_destroy(&bridge->cond);
+                pthread_mutex_destroy(&bridge->lock);
+                free(bridge);
+                return nullptr;
+            }
+            pthread_cond_wait(&bridge->cond, &bridge->lock);
+        }
+
+        int socketFd = slot->socketFd;
+        int presentFenceFd = slot->presentFenceFd;
+        int previousReleaseFenceFd = slot->previousReleaseFenceFd;
+        uint64_t eventId = slot->eventId;
+        int64_t submitNs = slot->submitNs;
+        LoriePresentTag presentTag = slot->presentTag;
+        LorieFrameTimeline timeline = slot->timeline;
+        bool timelineValid = slot->timelineValid;
+        bool reportDirectFeedback = slot->reportDirectFeedback;
+        pthread_mutex_unlock(&bridge->lock);
+
+        /* The current transaction's completion retires the previous buffer.
+         * Wait both dependencies before allowing X Present to idle it. */
+        bool previousReleased =
+            waitAndCloseFence(previousReleaseFenceFd);
+        bool presented = true;
+        if (presentFenceFd != previousReleaseFenceFd)
+            presented = waitAndCloseFence(presentFenceFd);
+        int64_t observedPresentNs = monotonicTimeNs();
+
+        if (!previousReleased || !presented) {
+            loge("DEBUG: SurfaceControl fence failed; retaining X Present ownership");
+        } else if (reportDirectFeedback && presentTag.tag &&
+            (presentTag.options & LORIE_PRESENT_OPTION_BACKEND_RELEASE)) {
+            lorieEvent event{};
+            event.presentBackendRelease.t = EVENT_PRESENT_BACKEND_RELEASE;
+            event.presentBackendRelease.mode =
+                LORIE_PRESENT_BACKEND_RELEASE_CONSUMED;
+            event.presentBackendRelease.presentTag = presentTag;
+            if (timelineValid) {
+                event.presentBackendRelease.deadlineUs = timeline.deadlineUs;
+                event.presentBackendRelease.expectedUs = timeline.expectedUs;
+                event.presentBackendRelease.opportunityUs = timeline.opportunityUs;
+                event.presentBackendRelease.opportunityMsc = timeline.opportunityMsc;
+            }
+            writeEventNoSignal(socketFd, event);
+        }
+        if (previousReleased && presented && reportDirectFeedback &&
+            presentTag.tag && presentTag.feedbackEid &&
+            (presentTag.options & LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK)) {
+            lorieEvent event{};
+            event.presentFeedback.t = EVENT_PRESENT_FEEDBACK;
+            event.presentFeedback.status = LORIE_PRESENT_FEEDBACK_PRESENTED;
+            event.presentFeedback.surfaceGeneration = bridge->generation;
+            event.presentFeedback.rendererSerial = slot->sequence;
+            event.presentFeedback.presentTag = presentTag;
+            event.presentFeedback.submitNs = submitNs;
+            event.presentFeedback.presentNs = observedPresentNs;
+            writeEventNoSignal(socketFd, event);
+        }
+        if (previousReleased && presented && eventId) {
+            lorieEvent event{};
+            event.surfaceControlComplete.t = EVENT_SURFACE_CONTROL_COMPLETE;
+            event.surfaceControlComplete.eventId = eventId;
+            event.surfaceControlComplete.observedPresentNs = observedPresentNs;
+            writeEventNoSignal(socketFd, event);
+        }
+        if (socketFd >= 0)
+            close(socketFd);
+
+        pthread_mutex_lock(&bridge->lock);
+        *slot = {};
+        bridge->pending--;
+        bridge->workerSequence++;
+        pthread_cond_broadcast(&bridge->cond);
+        pthread_mutex_unlock(&bridge->lock);
+    }
 }
 
 /* DEBUG: Record where renderer capacity is consumed without changing the
@@ -170,6 +467,8 @@ static bool readFrameTimeline(const lorie_shared_server_state* state,
             &state->latestFrameTimeline.opportunityUs, __ATOMIC_RELAXED);
         out->opportunityMsc = __atomic_load_n(
             &state->latestFrameTimeline.opportunityMsc, __ATOMIC_RELAXED);
+        out->vsyncId = __atomic_load_n(
+            &state->latestFrameTimeline.vsyncId, __ATOMIC_RELAXED);
         after = __atomic_load_n(&state->latestFrameTimeline.version,
                                 __ATOMIC_ACQUIRE);
         if (before == after && !(after & 1))
@@ -178,6 +477,34 @@ static bool readFrameTimeline(const lorie_shared_server_state* state,
 
     return out->deadlineUs && out->expectedUs && out->opportunityUs &&
         out->opportunityMsc;
+}
+
+static bool readSurfaceControlRequest(const lorie_shared_server_state* state,
+                                      LorieSurfaceControlRequest* out) {
+    uint32_t before, after;
+
+    if (!state || !out)
+        return false;
+    for (;;) {
+        before = __atomic_load_n(&state->surfaceControlRequest.version,
+                                 __ATOMIC_ACQUIRE);
+        if (!before || (before & 1))
+            return false;
+        out->kind = __atomic_load_n(&state->surfaceControlRequest.kind,
+                                    __ATOMIC_RELAXED);
+        out->eventId = __atomic_load_n(&state->surfaceControlRequest.eventId,
+                                       __ATOMIC_RELAXED);
+        out->bufferId = __atomic_load_n(&state->surfaceControlRequest.bufferId,
+                                        __ATOMIC_RELAXED);
+        out->targetMsc = __atomic_load_n(&state->surfaceControlRequest.targetMsc,
+                                         __ATOMIC_RELAXED);
+        after = __atomic_load_n(&state->surfaceControlRequest.version,
+                                __ATOMIC_ACQUIRE);
+        if (before == after) {
+            out->version = before;
+            return out->kind != LORIE_SURFACECONTROL_REQUEST_NONE;
+        }
+    }
 }
 
 /* DEBUG: Stage-E validation only.  This deliberately does not advertise a
@@ -1180,6 +1507,197 @@ void Renderer::setWindow(JNIEnv *env, jobject jsfc) {
     pthread_mutex_unlock(&stateLock);
 }
 
+void Renderer::configureSurfaceControl() {
+    static uint32_t generationCounter = 0;
+
+    if (!state || !state->surfaceControlEnabled || win == defaultWin ||
+        !connFdPtr || *connFdPtr < 0) {
+        if (state) {
+            state->surfaceControlAvailable = false;
+            state->surfaceControlEligible = false;
+        }
+        return;
+    }
+    if (surfaceControlBridge) {
+        state->surfaceControlAvailable = true;
+        return;
+    }
+
+    pthread_once(&surfaceControlApiOnce, initializeSurfaceControlApi);
+    if (!surfaceControlApi.baseAvailable) {
+        loge("DEBUG: SurfaceControl API-29 base unavailable; retaining GLES presentation");
+        state->surfaceControlAvailable = false;
+        return;
+    }
+
+    ASurfaceControl* control = surfaceControlApi.createFromWindow(
+        win, "Termux:X11 experimental direct presentation");
+    if (!control) {
+        loge("DEBUG: ASurfaceControl_createFromWindow failed; retaining GLES presentation");
+        state->surfaceControlAvailable = false;
+        return;
+    }
+
+    void* storage = calloc(1, sizeof(SurfaceControlBridge));
+    if (!storage) {
+        surfaceControlApi.release(control);
+        state->surfaceControlAvailable = false;
+        return;
+    }
+    auto* bridge = new (storage) SurfaceControlBridge();
+    bridge->control = control;
+    bridge->nextSequence = bridge->workerSequence = 1;
+    bridge->generation = __atomic_add_fetch(&generationCounter, 1,
+                                             __ATOMIC_RELAXED);
+    pthread_mutex_init(&bridge->lock, nullptr);
+    pthread_cond_init(&bridge->cond, nullptr);
+    if (pthread_create(&bridge->worker, nullptr,
+                       surfaceControlCompletionWorker, bridge) != 0) {
+        pthread_cond_destroy(&bridge->cond);
+        pthread_mutex_destroy(&bridge->lock);
+        surfaceControlApi.release(control);
+        free(bridge);
+        state->surfaceControlAvailable = false;
+        return;
+    }
+    pthread_detach(bridge->worker);
+
+    /* A newly created child is visible by default.  Hide the empty layer
+     * before advertising it to the X-side flip selector. */
+    ASurfaceTransaction* transaction = surfaceControlApi.transactionCreate();
+    surfaceControlApi.setVisibility(
+        transaction, control, ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+    surfaceControlApi.transactionApply(transaction);
+    surfaceControlApi.transactionDelete(transaction);
+
+    surfaceControlBridge = bridge;
+    state->surfaceControlActive = false;
+    state->surfaceControlEligible = false;
+    state->surfaceControlAvailable = true;
+    log("DEBUG: API-29 SurfaceControl transport available (backpressure=%d frameTimeline=%d)",
+        surfaceControlApi.setBackPressure != nullptr,
+        surfaceControlApi.setFrameTimeline != nullptr);
+}
+
+void Renderer::stopSurfaceControl(uint64_t completionEventId) {
+    SurfaceControlBridge* bridge = surfaceControlBridge;
+    if (!bridge)
+        return;
+
+    int connFd = connFdPtr ? *connFdPtr : -1;
+    ASurfaceTransaction* transaction = surfaceControlApi.transactionCreate();
+    if (!transaction) {
+        loge("DEBUG: could not retire SurfaceControl safely; keeping it active");
+        return;
+    }
+    SurfaceControlBridge::Slot* slot = reserveSurfaceControlSlot(
+        bridge, connFd, completionEventId, nullptr, nullptr, false);
+    if (!slot) {
+        surfaceControlApi.transactionDelete(transaction);
+        loge("DEBUG: could not retire SurfaceControl safely; keeping it active");
+        return;
+    }
+
+    surfaceControlApi.setVisibility(
+        transaction, bridge->control,
+        ASURFACE_TRANSACTION_VISIBILITY_HIDE);
+    surfaceControlApi.reparent(transaction, bridge->control, nullptr);
+    surfaceControlApi.setOnComplete(transaction, slot,
+                                    surfaceControlOnComplete);
+    surfaceControlApi.transactionApply(transaction);
+    surfaceControlApi.transactionDelete(transaction);
+
+    pthread_mutex_lock(&bridge->lock);
+    bridge->stopping = true;
+    pthread_cond_broadcast(&bridge->cond);
+    pthread_mutex_unlock(&bridge->lock);
+    surfaceControlBridge = nullptr;
+    log("DEBUG: SurfaceControl transport retiring (completion event %llu)",
+        (unsigned long long) completionEventId);
+    if (state) {
+        state->surfaceControlAvailable = false;
+        state->surfaceControlActive = false;
+        state->surfaceControlEligible = false;
+    }
+}
+
+static bool submitSurfaceControlFrame(
+    Renderer* renderer, LorieBuffer* buffer,
+    const LorieSurfaceControlRequest& request,
+    const LoriePresentTag& presentTag,
+    const LorieFrameTimeline* timeline,
+    int logicalWidth, int logicalHeight,
+    int destinationWidth, int destinationHeight) {
+    SurfaceControlBridge* bridge = renderer->surfaceControlBridge;
+    const LorieBuffer_Desc* desc = LorieBuffer_description(buffer);
+    if (!bridge || desc->type != LORIEBUFFER_AHARDWAREBUFFER ||
+        !desc->buffer || !renderer->connFdPtr || *renderer->connFdPtr < 0)
+        return false;
+
+    ASurfaceTransaction* transaction = surfaceControlApi.transactionCreate();
+    if (!transaction)
+        return false;
+    SurfaceControlBridge::Slot* slot = reserveSurfaceControlSlot(
+        bridge, *renderer->connFdPtr, request.eventId, &presentTag,
+        timeline, true);
+    if (!slot) {
+        surfaceControlApi.transactionDelete(transaction);
+        return false;
+    }
+
+    ARect source = { 0, 0, logicalWidth, logicalHeight };
+    ARect destination = { 0, 0, destinationWidth, destinationHeight };
+    ARect damage = source;
+    surfaceControlApi.setBuffer(transaction, bridge->control,
+                                desc->buffer, -1);
+    surfaceControlApi.setGeometry(transaction, bridge->control,
+                                  source, destination, 0);
+    surfaceControlApi.setTransparency(
+        transaction, bridge->control,
+        ASURFACE_TRANSACTION_TRANSPARENCY_OPAQUE);
+    surfaceControlApi.setDataSpace(transaction, bridge->control,
+                                   ADATASPACE_SRGB);
+    surfaceControlApi.setDamageRegion(transaction, bridge->control,
+                                      &damage, 1);
+    surfaceControlApi.setZOrder(transaction, bridge->control, 1);
+    surfaceControlApi.setVisibility(
+        transaction, bridge->control,
+        ASURFACE_TRANSACTION_VISIBILITY_SHOW);
+    if (surfaceControlApi.setBackPressure)
+        surfaceControlApi.setBackPressure(transaction, bridge->control,
+                                           true);
+    if (timeline && timeline->expectedUs)
+        surfaceControlApi.setDesiredPresentTime(
+            transaction, (int64_t) timeline->expectedUs * 1000);
+    if (surfaceControlApi.setFrameTimeline && timeline &&
+        timeline->vsyncId >= 0)
+        surfaceControlApi.setFrameTimeline(transaction,
+                                           (AVsyncId) timeline->vsyncId);
+    surfaceControlApi.setOnComplete(transaction, slot,
+                                    surfaceControlOnComplete);
+    surfaceControlApi.transactionApply(transaction);
+    surfaceControlApi.transactionDelete(transaction);
+
+    bool wasActive = renderer->state->surfaceControlActive;
+    renderer->state->surfaceControlActive = true;
+    if (!wasActive)
+        log("DEBUG: SurfaceControl direct presentation activated for %dx%d buffer %llu",
+            logicalWidth, logicalHeight,
+            (unsigned long long) desc->id);
+    return true;
+}
+
+static void completeSurfaceControlFallback(Renderer* renderer,
+                                           uint64_t eventId) {
+    if (!eventId || !renderer->connFdPtr || *renderer->connFdPtr < 0)
+        return;
+    lorieEvent event{};
+    event.surfaceControlComplete.t = EVENT_SURFACE_CONTROL_COMPLETE;
+    event.surfaceControlComplete.eventId = eventId;
+    event.surfaceControlComplete.observedPresentNs = monotonicTimeNs();
+    writeEventNoSignal(*renderer->connFdPtr, event);
+}
+
 void Renderer::releaseWinAndSurface(ANativeWindow** anw, EGLSurface *esfc) {
     if (esfc && *esfc && *esfc != defaultSfc) {
         // Requeue the dequeued buffer, causes flickering during window reconfiguring
@@ -1246,6 +1764,7 @@ void Renderer::refreshContext() {
      * as unknown before destroying the surface rather than querying them on a
      * new generation. */
     resetPresentFeedback(true);
+    stopSurfaceControl();
     releaseWinAndSurface(&win, &sfc);
 
     if (pendingWin && (width <= 0 || height <= 0)) {
@@ -1279,6 +1798,7 @@ void Renderer::refreshContext() {
 
     eglSwapInterval(egl_display, 0);
     configurePresentFeedbackSurface();
+    configureSurfaceControl();
 
     // We should redraw image at least once right after surface change
     if (state)
@@ -1473,6 +1993,11 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
                         __ATOMIC_ACQUIRE) : 0;
     LorieFrameTimeline renderingTimeline{};
     bool renderingTimelineValid = readFrameTimeline(state, &renderingTimeline);
+    LorieSurfaceControlRequest surfaceControlRequest{};
+    bool surfaceControlRequestPending =
+        readSurfaceControlRequest(state, &surfaceControlRequest) &&
+        surfaceControlRequest.version != lastSurfaceControlRequestVersion &&
+        surfaceControlRequest.kind == LORIE_SURFACECONTROL_REQUEST_FLIP;
 
     // Early returns below skip the applyPendingGpuCopiesLocked() call further down, which would
     // stall copies queued for windows unrelated to root while root itself isn't ready yet.
@@ -1584,6 +2109,19 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
                        : (sourceHeight < (float) expectedH ? panSourceTop : 0.f);
     }
     float sourceLeft = panSourceLeft, sourceTop = panSourceTop;
+    bool surfaceControlStrictEligible =
+        desc->type == LORIEBUFFER_AHARDWAREBUFFER && desc->buffer &&
+        zoomPercent == 100 && !bottomHidden && hiddenBottom == 0 &&
+        renderViewportX == 0 && renderViewportY == 0 &&
+        renderViewportW == surfaceW && renderViewportH == surfaceH &&
+        expectedW == surfaceW && expectedH == surfaceH &&
+        sourceLeft == 0.f && sourceTop == 0.f &&
+        sourceWidth == (float) expectedW && sourceHeight == (float) expectedH &&
+        (!state->cursor.visible || !state->cursor.width || !state->cursor.height);
+    state->surfaceControlEligible = surfaceControlStrictEligible;
+    bool surfaceControlEligible = surfaceControlRequestPending &&
+        surfaceControlRequest.bufferId == desc->id &&
+        surfaceControlStrictEligible;
 
     glDisable(GL_SCISSOR_TEST);
     glViewport(0, 0, surfaceW, surfaceH);
@@ -1658,6 +2196,44 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
                          lastSubmittedPresentTag, __ATOMIC_RELAXED);
     }
     state->drawRequested = FALSE;
+
+    bool surfaceControlWasActive = state->surfaceControlActive;
+    uint64_t surfaceControlFallbackEventId = 0;
+    if (surfaceControlRequestPending) {
+        lastSurfaceControlRequestVersion = surfaceControlRequest.version;
+        if (surfaceControlEligible && !gpuCopySerial &&
+            submitSurfaceControlFrame(
+                this, buffer, surfaceControlRequest, framePresentTag,
+                renderingTimelineValid ? &renderingTimeline : nullptr,
+                expectedW, expectedH, surfaceW, surfaceH)) {
+            if (framePresentTag.tag) {
+                lastSubmittedPresentTag = framePresentTag.tag;
+                if (state->rendererTimingEnabled) {
+                    __atomic_fetch_add(&state->rendererTiming.presentTagAttached,
+                                       1, __ATOMIC_RELAXED);
+                    __atomic_store_n(
+                        &state->rendererTiming.lastSubmittedPresentTag,
+                        lastSubmittedPresentTag, __ATOMIC_RELAXED);
+                }
+            }
+            if (renderingOpportunity) {
+                lastRenderedOpportunity = renderingOpportunity;
+                state->waitForNextFrame =
+                    __atomic_load_n(&state->frameOpportunitySequence,
+                                    __ATOMIC_ACQUIRE) == renderingOpportunity;
+            } else {
+                state->waitForNextFrame = true;
+            }
+            lorie_mutex_unlock(&state->lock, &state->lockingPid);
+            state->renderedFrames++;
+            return;
+        }
+
+        /* The first strict-eligibility miss can fall back directly.  If a
+         * SurfaceControl buffer was already active, retire its reference in
+         * a removal transaction after queuing the GLES replacement below. */
+        surfaceControlFallbackEventId = surfaceControlRequest.eventId;
+    }
 
     LorieBuffer_bindTexture(buffer);
     if (desc->type == LORIEBUFFER_FD)
@@ -1753,6 +2329,14 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
                                   eglFrameId);
     }
 
+    if (surfaceControlFallbackEventId && swapResult == EGL_TRUE) {
+        if (surfaceControlWasActive)
+            stopSurfaceControl(surfaceControlFallbackEventId);
+        else
+            completeSurfaceControlFallback(
+                this, surfaceControlFallbackEventId);
+    }
+
     // Perform a little drawing operation to make sure the next buffer is ready on the next invocation of drawing
     int64_t acquireStartNs = state->rendererTimingEnabled ? monotonicTimeNs() : 0;
     glEnable(GL_SCISSOR_TEST);
@@ -1774,7 +2358,7 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
 }
 
 bool Renderer::shouldWait(bool *waitingForBuffers) {
-    bool buffersChanged, gpuCopyPending;
+    bool buffersChanged, gpuCopyPending, surfaceControlUnflipPending = false;
     if (viewportChanged) {
         // setWindow drops the expected size, so the buffer rejected right after it fits again
         // as soon as the viewport is reapplied, and no new buffer is going to arrive.
@@ -1785,7 +2369,15 @@ bool Renderer::shouldWait(bool *waitingForBuffers) {
     buffersChanged = !xorg_list_is_empty(&addedBuffers) || !xorg_list_is_empty(&removedBuffers);
     pthread_spin_unlock(&bufferLock);
     gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
+    if (state) {
+        LorieSurfaceControlRequest request{};
+        surfaceControlUnflipPending =
+            readSurfaceControlRequest(state, &request) &&
+            request.version != lastSurfaceControlRequestVersion &&
+            request.kind == LORIE_SURFACECONTROL_REQUEST_UNFLIP;
+    }
     if (stateChanged || windowChanged || buffersChanged || gpuCopyPending ||
+        surfaceControlUnflipPending ||
         (state && __atomic_load_n(&state->presentFeedbackPollSerial, __ATOMIC_ACQUIRE) !=
                   presentFeedbackPollSerialSeen))
         // If there are pending changes we should process them immediately.
@@ -1828,6 +2420,7 @@ void Renderer::threadLoop() {
             struct lorie_shared_server_state* oldState = nullptr;
             if (state && pendingState != state) {
                 resetPresentFeedback(true);
+                stopSurfaceControl();
                 oldState = state;
             }
 
@@ -1836,6 +2429,7 @@ void Renderer::threadLoop() {
             stateChanged = false;
             waitingForBuffers = false;
             lastRenderedOpportunity = 0;
+            lastSurfaceControlRequestVersion = 0;
             if (state) {
                 uint32_t sequence = __atomic_load_n(
                     &state->frameOpportunitySequence, __ATOMIC_ACQUIRE);
@@ -1856,6 +2450,8 @@ void Renderer::threadLoop() {
 
             if (state && win != defaultWin)
                 configurePresentFeedbackSurface();
+            if (state && win != defaultWin)
+                configureSurfaceControl();
         }
 
         if (windowChanged)
@@ -1876,6 +2472,19 @@ void Renderer::threadLoop() {
         /* DEBUG: Choreographer wakes this existing renderer thread while an
          * EGL timestamp is pending, including for an otherwise static frame. */
         pollPresentFeedback();
+
+        if (state) {
+            LorieSurfaceControlRequest request{};
+            if (readSurfaceControlRequest(state, &request) &&
+                request.version != lastSurfaceControlRequestVersion &&
+                request.kind == LORIE_SURFACECONTROL_REQUEST_UNFLIP) {
+                lastSurfaceControlRequestVersion = request.version;
+                if (surfaceControlBridge)
+                    stopSurfaceControl(request.eventId);
+                else
+                    loge("DEBUG: SurfaceControl unflip lost its bridge; retaining X Present ownership");
+            }
+        }
 
         // Prefer a full redraw over the standalone apply below so a pending GPU copy shares one
         // lock+fence with the root/cursor draw, instead of two GPU round trips per frame.
@@ -1902,6 +2511,7 @@ void Renderer::threadLoop() {
         LorieBuffer_release(buf);
     pthread_spin_unlock(&bufferLock);
 
+    stopSurfaceControl();
     if (state) {
         resetPresentFeedback(true);
         munmap(state, sizeof(*state));

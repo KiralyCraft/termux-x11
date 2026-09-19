@@ -486,6 +486,26 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 lorieWakeServer();
                 break;
             }
+            case EVENT_SURFACE_CONTROL_COMPLETE: {
+                auto *copy = static_cast<lorieEvent*>(calloc(1, sizeof(lorieEvent)));
+                if (!copy)
+                    break;
+                *copy = e;
+                QueueWorkProc(+[](__unused ClientPtr pClient, void *closure) -> Bool {
+                    /* Present's flip queues are X-server-thread-owned.  The
+                     * SurfaceControl worker reaches this only after the
+                     * previous buffer's release fence and this transaction's
+                     * presentation fence are satisfied. */
+                    auto *event = static_cast<lorieEvent*>(closure);
+                    lorieHandleSurfaceControlComplete(
+                        event->surfaceControlComplete.eventId,
+                        event->surfaceControlComplete.observedPresentNs);
+                    free(event);
+                    return TRUE;
+                }, nullptr, copy);
+                lorieWakeServer();
+                break;
+            }
             case EVENT_SYNC: {
                 auto serial = (uintptr_t) e.sync.serial;
                 QueueWorkProc(+[](__unused ClientPtr pClient, void *closure) -> Bool {

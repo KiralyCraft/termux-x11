@@ -237,6 +237,11 @@ void OsVendorInit(void) {
         lorieScreen.state->presentFeedbackEnabled =
             enabled && strcmp(enabled, "0") != 0;
     }
+    {
+        const char *enabled = getenv("TERMUX_X11_EXPERIMENTAL_SURFACECONTROL");
+        lorieScreen.state->surfaceControlEnabled =
+            enabled && strcmp(enabled, "0") != 0;
+    }
     lorieScreen.state->rendererTimingEnabled = lorieServerDebugEnabled;
 
     lorieListenForKnocks();
@@ -625,7 +630,7 @@ static void loriePerformVblanks(void);
 static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     int status, nonEmpty;
     uint64_t pendingVblanks, vblankUst;
-    int64_t timelineDeadlineNs, timelineExpectedNs;
+    int64_t timelineDeadlineNs, timelineExpectedNs, timelineVsyncId;
     LoriePixmapPriv* priv;
     PixmapPtr root = pScreenPtr && pScreenPtr->root ? pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
 
@@ -634,6 +639,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     vblankUst = pvfb->pending_vblank_ust;
     timelineDeadlineNs = pvfb->pending_timeline_deadline_ns;
     timelineExpectedNs = pvfb->pending_timeline_expected_ns;
+    timelineVsyncId = pvfb->pending_timeline_vsync_id;
     pvfb->pending_vblanks = 0;
     pvfb->redraw_queued = FALSE;
     pthread_mutex_unlock(&pvfb->vblank_lock);
@@ -665,6 +671,8 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
                          vblankUst, __ATOMIC_RELAXED);
         __atomic_store_n(&pvfb->state->latestFrameTimeline.opportunityMsc,
                          pvfb->current_msc, __ATOMIC_RELAXED);
+        __atomic_store_n(&pvfb->state->latestFrameTimeline.vsyncId,
+                         timelineVsyncId, __ATOMIC_RELAXED);
         __atomic_store_n(&pvfb->state->latestFrameTimeline.version,
                          version + 2, __ATOMIC_RELEASE);
     }
@@ -1617,6 +1625,49 @@ Bool lorieGpuCopyIsDone(uint64_t serial) {
     return __atomic_load_n(&pvfb->state->gpuCopyQueue.completedSerial, __ATOMIC_ACQUIRE) >= serial;
 }
 
+/* DEBUG: Hand one Present flip at a time to the Android SurfaceControl
+ * experiment.  Present itself already serializes flips, so overwriting an
+ * unconsumed request would indicate a lifecycle bug and is intentionally not
+ * made into a second queue here. */
+static void loriePublishSurfaceControlRequest(uint32_t kind,
+                                              uint64_t event_id,
+                                              uint64_t buffer_id,
+                                              uint64_t target_msc) {
+    uint32_t version;
+
+    if (!pvfb || !pvfb->state)
+        return;
+    version = __atomic_load_n(
+        &pvfb->state->surfaceControlRequest.version, __ATOMIC_RELAXED);
+    if (version & 1)
+        version++;
+    __atomic_store_n(&pvfb->state->surfaceControlRequest.version,
+                     version + 1, __ATOMIC_RELEASE);
+    __atomic_store_n(&pvfb->state->surfaceControlRequest.kind, kind,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->surfaceControlRequest.eventId, event_id,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->surfaceControlRequest.bufferId, buffer_id,
+                     __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->surfaceControlRequest.targetMsc,
+                     target_msc, __ATOMIC_RELAXED);
+    __atomic_store_n(&pvfb->state->surfaceControlRequest.version,
+                     version + 2, __ATOMIC_RELEASE);
+    lorieWakeRenderer();
+}
+
+void lorieHandleSurfaceControlComplete(uint64_t event_id,
+                                       int64_t observed_present_ns) {
+    uint64_t ust, msc;
+
+    if (!event_id)
+        return;
+    loriePresentGetUstMsc(NULL, &ust, &msc);
+    if (observed_present_ns > 0)
+        ust = (uint64_t) observed_present_ns / 1000;
+    present_event_notify(event_id, ust, msc);
+}
+
 void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer) {
     LoriePixmapPriv *priv = LORIE_PIXMAP_PRIV_FROM_PIXMAP(pixmap);
     if (priv && priv->buffer)
@@ -1654,6 +1705,20 @@ Bool loriePresentFlip(RRCrtcPtr crtc, uint64_t event_id, uint64_t target_msc, Pi
     lorieRegisterBuffer(priv->buffer);
     RegionReset(DamageRegion(pvfb->damage), &box);
 
+    /* DEBUG: The native fence has already completed through PR96 before this
+     * callback is reached.  SurfaceControl only replaces the downstream
+     * presentation transport; it never substitutes timing for readiness. */
+    if (pvfb->state->surfaceControlEnabled &&
+        pvfb->state->surfaceControlAvailable && priv->imported &&
+        desc->type == LORIEBUFFER_AHARDWAREBUFFER &&
+        (pvfb->state->surfaceControlActive ||
+         pvfb->state->surfaceControlEligible)) {
+        loriePublishSurfaceControlRequest(
+            LORIE_SURFACECONTROL_REQUEST_FLIP, event_id, desc->id,
+            target_msc);
+        return TRUE;
+    }
+
     // A successful Present flip must complete when it becomes visible, not while
     // present_execute() is still changing the screen pixmap. Android displays the
     // renderer's next swap on a Choreographer vblank, so report completion there.
@@ -1665,6 +1730,13 @@ Bool loriePresentFlip(RRCrtcPtr crtc, uint64_t event_id, uint64_t target_msc, Pi
 }
 
 void loriePresentUnflip(__unused ScreenPtr screen, uint64_t event_id) {
+    if (pvfb->state->surfaceControlEnabled &&
+        pvfb->state->surfaceControlAvailable &&
+        pvfb->state->surfaceControlActive) {
+        loriePublishSurfaceControlRequest(
+            LORIE_SURFACECONTROL_REQUEST_UNFLIP, event_id, 0, 0);
+        return;
+    }
     present_event_notify(event_id, 0, 0);
 }
 
