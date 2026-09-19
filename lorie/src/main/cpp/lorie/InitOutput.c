@@ -104,6 +104,9 @@ typedef struct {
     uint64_t gpuCopySerialCounter;
     uint64_t rootGpuCopyPending;
     uint64_t presentTagCounter;
+    uint64_t presentReadyPublishes;
+    uint64_t presentReadyWakeupsOutsideVblank;
+    Bool handlingVblank;
 
     /* DEBUG: aggregate actual Android display feedback without changing X
      * Present completion semantics. Updated from an X-server-thread work
@@ -638,6 +641,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     if (!pendingVblanks)
         return TRUE;
 
+    pvfb->handlingVblank = TRUE;
     pvfb->current_msc += pendingVblanks;
     if (pendingVblanks > 1)
         pvfb->coalesced_vblanks += pendingVblanks - 1;
@@ -659,14 +663,15 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     }
 
     if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
-        return TRUE;
+        goto out;
 
     nonEmpty = RegionNotEmpty(DamageRegion(pvfb->damage));
     priv = root ? exaGetPixmapDriverPrivate(root) : NULL;
 
-    if (!priv)
+    if (!priv) {
         // Impossible situation, but let's skip this step
-        return TRUE;
+        goto out;
+    }
 
     if (nonEmpty && priv->buffer) {
         // We should unlock and lock buffer in order to update texture content on some devices
@@ -695,6 +700,8 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         lorieWakeRenderer();
     }
 
+out:
+    pvfb->handlingVblank = FALSE;
     return TRUE;
 }
 
@@ -822,7 +829,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             actual ? (double) totalNs / (double) actual / 1000000.0 : 0.0,
             (double) maxNs / 1000000.0);
     if (swapCount || acquireCount)
-        log(INFO, "DEBUG: renderer capacity: swap %u mean %.3fms max %.3fms over-period %u; next-buffer %u mean %.3fms max %.3fms over-period %u; opportunity-advanced-during-draw %u; coalesced-vblanks %llu",
+        log(INFO, "DEBUG: renderer capacity: swap %u mean %.3fms max %.3fms over-period %u; next-buffer %u mean %.3fms max %.3fms over-period %u; opportunity-advanced-during-draw %u; coalesced-vblanks %llu; present-ready-publishes %llu outside-vblank-wakes %llu",
             swapCount,
             swapCount ? (double) swapTotalUs / (double) swapCount / 1000.0 : 0.0,
             (double) swapMaxUs / 1000.0, swapOverPeriod,
@@ -830,10 +837,14 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             acquireCount ? (double) acquireTotalUs / (double) acquireCount / 1000.0 : 0.0,
             (double) acquireMaxUs / 1000.0, acquireOverPeriod,
             opportunityAdvancedDuringDraw,
-            (unsigned long long) pvfb->coalesced_vblanks);
+            (unsigned long long) pvfb->coalesced_vblanks,
+            (unsigned long long) pvfb->presentReadyPublishes,
+            (unsigned long long) pvfb->presentReadyWakeupsOutsideVblank);
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
     pvfb->coalesced_vblanks = 0;
+    pvfb->presentReadyPublishes = 0;
+    pvfb->presentReadyWakeupsOutsideVblank = 0;
     return 5000;
 }
 
@@ -1383,6 +1394,29 @@ void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial,
                      __ATOMIC_RELAXED);
     __atomic_store_n(&pvfb->state->latestPresentTag.version, version + 2,
                      __ATOMIC_RELEASE);
+
+    /* DEBUG: A wait fence may become ready after lorieRedraw() has already
+     * checked root damage for this Choreographer opportunity.  At this point
+     * the producer dependency and the CPU copy/flip are complete, so publish
+     * the root storage identity and wake the renderer immediately.  The
+     * renderer's opportunity predicate still prevents a second submission in
+     * the same display opportunity. */
+    {
+        PixmapPtr root = pScreenPtr && pScreenPtr->root ?
+            pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
+        LoriePixmapPriv *priv = root ? exaGetPixmapDriverPrivate(root) : NULL;
+
+        if (priv && priv->buffer) {
+            pvfb->state->rootWindowTextureID =
+                LorieBuffer_description(priv->buffer)->id;
+            pvfb->state->drawRequested = TRUE;
+            pvfb->presentReadyPublishes++;
+            if (!pvfb->handlingVblank) {
+                pvfb->presentReadyWakeupsOutsideVblank++;
+                lorieWakeRenderer();
+            }
+        }
+    }
     lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
 }
 
