@@ -1664,6 +1664,15 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     }
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
 
+    /* The root source is no longer sampled after the GPU fence above has
+     * completed.  Release the backend-submission slot at that exact boundary,
+     * before eglSwapBuffers() can add BufferQueue/backpressure latency.  This
+     * is deliberately independent from whether Android later accepts or
+     * presents the renderer output; those outcomes remain actual-feedback
+     * events. */
+    notifyPresentBackendRelease(
+        framePresentTag, LORIE_PRESENT_BACKEND_RELEASE_CONSUMED);
+
     EGLuint64KHR eglFrameId = 0;
     bool trackPresent = presentFeedbackSurfaceEnabled &&
         getNextFrameIdANDROID(egl_display, sfc, &eglFrameId) == EGL_TRUE;
@@ -1680,12 +1689,8 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
 
     if (swapResult != EGL_TRUE) {
         printEglError("Failed to swap buffers", __LINE__);
-        notifyPresentBackendRelease(
-            framePresentTag, LORIE_PRESENT_BACKEND_RELEASE_RETIRED);
         retirePresentTagUnknown(framePresentTag, gpuCopySerial);
     } else {
-        notifyPresentBackendRelease(
-            framePresentTag, LORIE_PRESENT_BACKEND_RELEASE_CONSUMED);
         if (framePresentTag.tag && !trackPresent &&
             (framePresentTag.options &
              LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK)) {
