@@ -97,6 +97,7 @@ typedef struct {
     int64_t pending_timeline_expected_ns;
     int64_t pending_timeline_vsync_id;
     Bool redraw_queued;
+    uint64_t coalesced_vblanks;
 
     uint64_t gpuCopySerialCounter;
     uint64_t rootGpuCopyPending;
@@ -284,6 +285,10 @@ static Bool lorieSetRendererWakeupCondWorkProc(__unused ClientPtr client, void* 
         // In case a signal was sent to the old mapping right before this swap.
         pthread_cond_signal(newCond);
     }
+
+    if (lorieServerDebugEnabled)
+        log(INFO, "DEBUG: renderer wakeup protocol: %s",
+            newWakeup ? "locked-sequence" : "legacy-condvar");
 
     if (oldMapping)
         munmap(oldMapping, oldMappingSize);
@@ -622,9 +627,17 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         return TRUE;
 
     pvfb->current_msc += pendingVblanks;
+    if (pendingVblanks > 1)
+        pvfb->coalesced_vblanks += pendingVblanks - 1;
     pvfb->last_vblank_ust = vblankUst;
     loriePerformVblanks();
 
+    /* DEBUG: Publish a counted opportunity before waking the renderer.  A
+     * renderer which is still finishing the previous submission snapshots
+     * the older value and therefore cannot erase this callback when it later
+     * updates the legacy Boolean. */
+    __atomic_fetch_add(&pvfb->state->frameOpportunitySequence, 1,
+                       __ATOMIC_RELEASE);
     pvfb->state->waitForNextFrame = false;
 
     if (__atomic_load_n(&pvfb->state->presentFeedbackPending, __ATOMIC_ACQUIRE)) {
@@ -746,6 +759,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     uint64_t actual, unknown, totalNs, maxNs, correlated, uncorrelated;
     uint32_t swapCount, swapTotalUs, swapMaxUs, swapOverPeriod;
     uint32_t acquireCount, acquireTotalUs, acquireMaxUs, acquireOverPeriod;
+    uint32_t opportunityAdvancedDuringDraw;
 
     pthread_mutex_lock(&pvfb->presentFeedbackLock);
     actual = pvfb->presentFeedbackPresented;
@@ -779,6 +793,9 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     acquireOverPeriod = __atomic_exchange_n(
         &pvfb->state->rendererTiming.acquireOverPeriod, 0,
         __ATOMIC_ACQ_REL);
+    opportunityAdvancedDuringDraw = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.opportunityAdvancedDuringDraw, 0,
+        __ATOMIC_ACQ_REL);
 
     if (pvfb->state->renderedFrames || gpuCopyAttempts)
         log(INFO, gpuCopyAttempts ? "%d frames in 5.0 seconds = %.1f FPS, %llu/%llu present copies offloaded to GPU"
@@ -793,15 +810,18 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             actual ? (double) totalNs / (double) actual / 1000000.0 : 0.0,
             (double) maxNs / 1000000.0);
     if (swapCount || acquireCount)
-        log(INFO, "DEBUG: renderer capacity: swap %u mean %.3fms max %.3fms over-period %u; next-buffer %u mean %.3fms max %.3fms over-period %u",
+        log(INFO, "DEBUG: renderer capacity: swap %u mean %.3fms max %.3fms over-period %u; next-buffer %u mean %.3fms max %.3fms over-period %u; opportunity-advanced-during-draw %u; coalesced-vblanks %llu",
             swapCount,
             swapCount ? (double) swapTotalUs / (double) swapCount / 1000.0 : 0.0,
             (double) swapMaxUs / 1000.0, swapOverPeriod,
             acquireCount,
             acquireCount ? (double) acquireTotalUs / (double) acquireCount / 1000.0 : 0.0,
-            (double) acquireMaxUs / 1000.0, acquireOverPeriod);
+            (double) acquireMaxUs / 1000.0, acquireOverPeriod,
+            opportunityAdvancedDuringDraw,
+            (unsigned long long) pvfb->coalesced_vblanks);
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
+    pvfb->coalesced_vblanks = 0;
     return 5000;
 }
 

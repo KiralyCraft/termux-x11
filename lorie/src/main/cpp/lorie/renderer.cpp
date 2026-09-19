@@ -799,6 +799,18 @@ uint32_t Renderer::rendererWakeSequence() const {
         __atomic_load_n(&stateWakeup->sequence, __ATOMIC_ACQUIRE) : 0;
 }
 
+bool Renderer::frameOpportunityAvailable() const {
+    uint32_t sequence;
+
+    if (!state)
+        return false;
+    sequence = __atomic_load_n(&state->frameOpportunitySequence,
+                               __ATOMIC_ACQUIRE);
+    if (sequence)
+        return sequence != lastRenderedOpportunity;
+    return !state->waitForNextFrame;
+}
+
 void Renderer::signalRenderer() {
     if (stateWakeup &&
         __atomic_load_n(&stateWakeup->lockedProtocol, __ATOMIC_ACQUIRE)) {
@@ -1395,6 +1407,9 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     float xfactor = 1.f;
     const LorieBuffer_Desc *desc = nullptr;
     EGLSync fence;
+    uint32_t renderingOpportunity = state ?
+        __atomic_load_n(&state->frameOpportunitySequence,
+                        __ATOMIC_ACQUIRE) : 0;
 
     // Early returns below skip the applyPendingGpuCopiesLocked() call further down, which would
     // stall copies queued for windows unrelated to root while root itself isn't ready yet.
@@ -1577,7 +1592,20 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
         __atomic_store_n(&state->gpuCopyQueue.completedSerial, gpuCopySerial, __ATOMIC_RELEASE);
         notifyGpuCopyDone();
     }
-    state->waitForNextFrame = true;
+    if (renderingOpportunity) {
+        uint32_t currentOpportunity = __atomic_load_n(
+            &state->frameOpportunitySequence, __ATOMIC_ACQUIRE);
+        if (currentOpportunity != renderingOpportunity &&
+            state->rendererTimingEnabled)
+            __atomic_fetch_add(
+                &state->rendererTiming.opportunityAdvancedDuringDraw, 1,
+                __ATOMIC_RELAXED);
+        lastRenderedOpportunity = renderingOpportunity;
+        state->waitForNextFrame = currentOpportunity == renderingOpportunity;
+    } else {
+        /* An older X server does not publish counted opportunities. */
+        state->waitForNextFrame = true;
+    }
     lorie_mutex_unlock(&state->lock, &state->lockingPid);
 
     EGLuint64KHR eglFrameId = 0;
@@ -1651,7 +1679,8 @@ bool Renderer::shouldWait(bool *waitingForBuffers) {
         lastRequestedBufferId = state->rootWindowTextureID;
     }
 
-    if (!state || !state->surfaceAvailable || state->waitForNextFrame || *waitingForBuffers)
+    if (!state || !state->surfaceAvailable ||
+        !frameOpportunityAvailable() || *waitingForBuffers)
         // Even in the case if there are pending changes, we can not draw it without rendering surface
         return true;
 
@@ -1688,6 +1717,13 @@ void Renderer::threadLoop() {
             pendingState = nullptr;
             stateChanged = false;
             waitingForBuffers = false;
+            lastRenderedOpportunity = 0;
+            if (state) {
+                uint32_t sequence = __atomic_load_n(
+                    &state->frameOpportunitySequence, __ATOMIC_ACQUIRE);
+                if (sequence)
+                    lastRenderedOpportunity = sequence - 1;
+            }
 
             if (state)
                 state->surfaceAvailable = win != defaultWin;
@@ -1726,7 +1762,7 @@ void Renderer::threadLoop() {
         // Prefer a full redraw over the standalone apply below so a pending GPU copy shares one
         // lock+fence with the root/cursor draw, instead of two GPU round trips per frame.
         bool gpuCopyPending = state && state->gpuCopyQueue.readIndex != state->gpuCopyQueue.writeIndex;
-        if (state && state->surfaceAvailable && !state->waitForNextFrame &&
+        if (state && state->surfaceAvailable && frameOpportunityAvailable() &&
             (state->drawRequested || state->cursor.moved || state->cursor.updated || gpuCopyPending))
             redrawLocked(&waitingForBuffers);
         else if (gpuCopyPending)

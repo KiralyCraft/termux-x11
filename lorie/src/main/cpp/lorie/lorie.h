@@ -320,6 +320,12 @@ struct lorie_shared_server_state {
      */
     volatile uint8_t waitForNextFrame;
 
+    /* DEBUG: Monotonic Choreographer opportunity token.  The legacy Boolean
+     * above can lose a newly cleared value when a callback races the tail of
+     * the preceding renderer submission.  Matching peers use this token as
+     * the predicate and retain the Boolean only for old-peer compatibility. */
+    volatile uint32_t frameOpportunitySequence;
+
     /* Needed to show FPS counter in logcat */
     volatile int renderedFrames;
 
@@ -337,6 +343,7 @@ struct lorie_shared_server_state {
         volatile uint32_t acquireTotalUs;
         volatile uint32_t acquireMaxUs;
         volatile uint32_t acquireOverPeriod;
+        volatile uint32_t opportunityAdvancedDuringDraw;
     } rendererTiming;
 
     /* DEBUG: presentation-timestamp collection is explicitly enabled by the
@@ -460,6 +467,7 @@ struct Renderer {
     uint64_t rendererPresentSerial = 0;
     LoriePresentTag latestContentPresentTag{};
     uint64_t lastSubmittedPresentTag = 0;
+    uint32_t lastRenderedOpportunity = 0;
     bool presentFeedbackExtensionAvailable = false;
     bool presentFeedbackSurfaceEnabled = false;
 
@@ -470,6 +478,7 @@ struct Renderer {
     void* initThread();
     int getWakeupCondFd() const;
     uint32_t rendererWakeSequence() const;
+    bool frameOpportunityAvailable() const;
     void signalRenderer();
     void waitForRendererSignal(uint32_t expectedSequence);
     void setFiltering(jint f);
