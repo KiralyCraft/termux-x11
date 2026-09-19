@@ -42,7 +42,7 @@ __attribute__((weak)) EGLClientBuffer eglGetNativeClientBufferANDROID(const stru
     body \
     if (state) \
         state->drawRequested = true; \
-    pthread_cond_signal(stateCond); \
+    signalRenderer(); \
     pthread_mutex_unlock(&stateLock); \
 } while (0)
 
@@ -740,17 +740,31 @@ void Renderer::init(JNIEnv* env, jobject view) {
 
     pthread_mutex_init(&stateLock, nullptr);
 
-    // Created once, never recreated; only the fd is (re)sent to the X server whenever it (re)connects.
+    // Created once, never recreated; only the fd is (re)sent to the X server
+    // whenever it (re)connects.  cond stays first for an older server which
+    // maps only sizeof(pthread_cond_t).
     pthread_condattr_t cond_attr;
+    pthread_mutexattr_t mutex_attr;
     pthread_condattr_init(&cond_attr);
     pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
-    stateCondFd = LorieBuffer_createRegion("renderer-cond", sizeof(pthread_cond_t));
-    stateCond = stateCondFd == -1 ? (pthread_cond_t*) MAP_FAILED : (pthread_cond_t*) mmap(nullptr, sizeof(pthread_cond_t), PROT_READ|PROT_WRITE, MAP_SHARED, stateCondFd, 0);
-    if (stateCond == MAP_FAILED) {
-        loge("Failed to allocate renderer wakeup cond var, aborting");
+    pthread_mutexattr_init(&mutex_attr);
+    pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+    stateCondFd = LorieBuffer_createRegion("renderer-wakeup",
+                                           sizeof(LorieRendererWakeup));
+    stateWakeup = stateCondFd == -1 ?
+        (LorieRendererWakeup*) MAP_FAILED :
+        (LorieRendererWakeup*) mmap(nullptr, sizeof(LorieRendererWakeup),
+                                    PROT_READ|PROT_WRITE, MAP_SHARED,
+                                    stateCondFd, 0);
+    if (stateWakeup == MAP_FAILED) {
+        loge("Failed to allocate renderer wakeup region, aborting");
         abort();
     }
+    memset(stateWakeup, 0, sizeof(*stateWakeup));
+    stateCond = &stateWakeup->cond;
     pthread_cond_init(stateCond, &cond_attr);
+    pthread_mutex_init(&stateWakeup->lock, &mutex_attr);
+    stateWakeup->magic = LORIE_RENDERER_WAKEUP_MAGIC;
 
     pthread_cond_init(&stateChangeFinishCond, nullptr);
     pthread_spin_init(&bufferLock, false);
@@ -767,7 +781,7 @@ void Renderer::destroy() {
 
     pthread_mutex_lock(&stateLock);
     stopping = true;
-    pthread_cond_signal(stateCond);
+    signalRenderer();
     pthread_mutex_unlock(&stateLock);
 
     pthread_join(thread, nullptr);
@@ -777,6 +791,42 @@ void Renderer::destroy() {
 
 int Renderer::getWakeupCondFd() const {
     return stateCondFd;
+}
+
+uint32_t Renderer::rendererWakeSequence() const {
+    return stateWakeup &&
+           __atomic_load_n(&stateWakeup->lockedProtocol, __ATOMIC_ACQUIRE) ?
+        __atomic_load_n(&stateWakeup->sequence, __ATOMIC_ACQUIRE) : 0;
+}
+
+void Renderer::signalRenderer() {
+    if (stateWakeup &&
+        __atomic_load_n(&stateWakeup->lockedProtocol, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_lock(&stateWakeup->lock);
+        __atomic_fetch_add(&stateWakeup->sequence, 1, __ATOMIC_RELEASE);
+        pthread_cond_signal(&stateWakeup->cond);
+        pthread_mutex_unlock(&stateWakeup->lock);
+    } else if (stateCond) {
+        pthread_cond_signal(stateCond);
+    }
+}
+
+void Renderer::waitForRendererSignal(uint32_t expectedSequence) {
+    if (!stateWakeup ||
+        !__atomic_load_n(&stateWakeup->lockedProtocol, __ATOMIC_ACQUIRE)) {
+        pthread_cond_wait(stateCond, &stateLock);
+        return;
+    }
+
+    /* stateLock protects activity-side state, while the shared mutex closes
+     * the cross-process check/sleep race.  Never hold both while blocking. */
+    pthread_mutex_unlock(&stateLock);
+    pthread_mutex_lock(&stateWakeup->lock);
+    if (expectedSequence ==
+        __atomic_load_n(&stateWakeup->sequence, __ATOMIC_ACQUIRE))
+        pthread_cond_wait(&stateWakeup->cond, &stateWakeup->lock);
+    pthread_mutex_unlock(&stateWakeup->lock);
+    pthread_mutex_lock(&stateLock);
 }
 
 void Renderer::setFiltering(jint f) {
@@ -981,7 +1031,7 @@ void Renderer::setSharedState(struct lorie_shared_server_state* newState) {
     pthread_mutex_lock(&stateLock);
     pendingState = newState;
     stateChanged = true;
-    pthread_cond_signal(stateCond);
+    signalRenderer();
 
     while(stateChanged)
         pthread_cond_wait(&stateChangeFinishCond, &stateLock);
@@ -992,7 +1042,7 @@ void Renderer::setSharedState(struct lorie_shared_server_state* newState) {
 void Renderer::addBuffer(LorieBuffer* buf) {
     pthread_spin_lock(&bufferLock);
     LorieBuffer_addToList(buf, &addedBuffers);
-    pthread_cond_signal(stateCond);
+    signalRenderer();
     pthread_spin_unlock(&bufferLock);
 }
 
@@ -1048,7 +1098,7 @@ void Renderer::setWindow(JNIEnv *env, jobject jsfc) {
     expectedW = expectedH = 0;
     windowChanged = TRUE;
 
-    pthread_cond_signal(stateCond);
+    signalRenderer();
 
     // We should wait until renderer destroys EGLSurface before SurfaceCallback::surfaceDestroyed finishes
     // Otherwise we will have weird errors like
@@ -1616,9 +1666,14 @@ bool Renderer::shouldWait(bool *waitingForBuffers) {
 void Renderer::threadLoop() {
     LorieBuffer* buf;
     bool waitingForBuffers = false;
+    pthread_mutex_lock(&stateLock);
     while (!stopping) {
-        while (!stopping && shouldWait(&waitingForBuffers))
-            pthread_cond_wait(stateCond, &stateLock);
+        while (!stopping) {
+            uint32_t wakeSequence = rendererWakeSequence();
+            if (!shouldWait(&waitingForBuffers))
+                break;
+            waitForRendererSignal(wakeSequence);
+        }
         if (stopping)
             break;
 
@@ -1710,7 +1765,9 @@ void Renderer::threadLoop() {
     // Intentionally not calling eglTerminate(egl_display): the EGLDisplay is a process-wide
     // driver connection, not a per-instance resource.
     ANativeWindow_release(defaultWin);
-    munmap(stateCond, sizeof(pthread_cond_t));
+    munmap(stateWakeup, sizeof(LorieRendererWakeup));
+    stateWakeup = nullptr;
+    stateCond = nullptr;
     close(stateCondFd);
     jvm->DetachCurrentThread();
 }

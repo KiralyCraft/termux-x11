@@ -38,6 +38,20 @@
 #define LORIE_PRESENT_FEEDBACK_PRESENTED 1
 #define LORIE_PRESENT_FEEDBACK_UNKNOWN   2
 
+/* Versioned cross-process renderer wakeup.  pthread_cond_t deliberately
+ * remains the first member so an older X server, which maps only that object,
+ * can continue to signal a newer activity.  A matching server sets
+ * lockedProtocol after validating magic and the backing-region size. */
+#define LORIE_RENDERER_WAKEUP_MAGIC 0x4c525731u
+typedef struct {
+    pthread_cond_t cond;
+    pthread_mutex_t lock;
+    uint32_t magic;
+    volatile uint32_t sequence;
+    volatile uint8_t lockedProtocol;
+    uint8_t reserved[3];
+} LorieRendererWakeup;
+
 /* DEBUG: Identity of the newest X Present whose contents were incorporated
  * into an Android renderer frame.  tag is server-monotonic and is the
  * publication/correlation key; window and serial retain the originating
@@ -398,8 +412,10 @@ struct Renderer {
     float reportedSourceLeft = -1.f, reportedSourceTop = -1.f, reportedSourceWidth = -1.f, reportedSourceHeight = -1.f;
 
     pthread_mutex_t stateLock{};
-    // Shared with the X server so it can signal us directly. Only this thread ever waits on it, so stateLock
-    // (the companion mutex) doesn't need to be shared too.
+    // Shared with the X server so it can signal us directly.  New peers use
+    // stateWakeup->lock plus sequence to close the predicate-check/sleep race;
+    // cond remains at offset zero for compatibility with an older server.
+    LorieRendererWakeup* stateWakeup = nullptr;
     pthread_cond_t* stateCond = nullptr;
     pthread_cond_t stateChangeFinishCond{};
     pthread_spinlock_t bufferLock{};
@@ -453,6 +469,9 @@ struct Renderer {
     void destroy();
     void* initThread();
     int getWakeupCondFd() const;
+    uint32_t rendererWakeSequence() const;
+    void signalRenderer();
+    void waitForRendererSignal(uint32_t expectedSequence);
     void setFiltering(jint f);
     void testCapabilities(int* legacy_drawing, int* gpu_present_disabled,
                           int* direct_allocation_validated);

@@ -145,10 +145,29 @@ typedef struct {
 
 static LorieChoreographerApi lorieChoreographerApi;
 
-// Owned by the activity process, handed to us over the connection socket. Points at a placeholder until
-// the first connection so callers don't need a NULL check.
+// Owned by the activity process, handed to us over the connection socket.
+// pthread_cond_t stays first in the extended mapping so old and new peers can
+// still connect.  Matching peers additionally use a shared mutex and sequence
+// to prevent a signal between predicate check and sleep from being lost.
 static pthread_cond_t rendererCondPlaceholder = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t* volatile rendererCond = &rendererCondPlaceholder;
+static LorieRendererWakeup* volatile rendererWakeup = NULL;
+static void* rendererWakeupMapping = NULL;
+static size_t rendererWakeupMappingSize = 0;
+
+static void lorieWakeRenderer(void) {
+    LorieRendererWakeup *wakeup = rendererWakeup;
+
+    if (wakeup &&
+        __atomic_load_n(&wakeup->lockedProtocol, __ATOMIC_ACQUIRE)) {
+        pthread_mutex_lock(&wakeup->lock);
+        __atomic_fetch_add(&wakeup->sequence, 1, __ATOMIC_RELEASE);
+        pthread_cond_signal(&wakeup->cond);
+        pthread_mutex_unlock(&wakeup->lock);
+    } else {
+        pthread_cond_signal(rendererCond);
+    }
+}
 
 typedef struct {
     LorieBuffer *buffer;
@@ -225,19 +244,49 @@ void OsVendorInit(void) {
 // a signal.
 static Bool lorieSetRendererWakeupCondWorkProc(__unused ClientPtr client, void* closure) {
     int fd = (int) (intptr_t) closure;
-    pthread_cond_t* newCond = mmap(NULL, sizeof(pthread_cond_t), PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0);
+    struct stat statbuf = {0};
+    size_t mappingSize = sizeof(pthread_cond_t);
+    void *newMapping;
+    pthread_cond_t *newCond;
+    LorieRendererWakeup *newWakeup = NULL;
+
+    if (fstat(fd, &statbuf) == 0 &&
+        statbuf.st_size >= (off_t) sizeof(LorieRendererWakeup))
+        mappingSize = sizeof(LorieRendererWakeup);
+    newMapping = mmap(NULL, mappingSize, PROT_READ|PROT_WRITE, MAP_SHARED,
+                      fd, 0);
     close(fd); // mmap already keeps the region alive.
-    if (newCond == MAP_FAILED) {
-        log(ERROR, "Failed to map renderer wakeup cond var, keeping the old one");
+    if (newMapping == MAP_FAILED) {
+        log(ERROR, "Failed to map renderer wakeup region, keeping the old one");
         return TRUE;
     }
+    newCond = (pthread_cond_t*) newMapping;
+    if (mappingSize >= sizeof(LorieRendererWakeup)) {
+        LorieRendererWakeup *candidate = newMapping;
+        if (candidate->magic == LORIE_RENDERER_WAKEUP_MAGIC)
+            newWakeup = candidate;
+    }
 
-    pthread_cond_t* old = rendererCond;
+    void *oldMapping = rendererWakeupMapping;
+    size_t oldMappingSize = rendererWakeupMappingSize;
     rendererCond = newCond;
-    pthread_cond_signal(newCond); // in case a signal was sent to `old` right before this swap
+    rendererWakeup = newWakeup;
+    rendererWakeupMapping = newMapping;
+    rendererWakeupMappingSize = mappingSize;
 
-    if (old != &rendererCondPlaceholder)
-        munmap(old, sizeof(pthread_cond_t));
+    if (newWakeup) {
+        pthread_mutex_lock(&newWakeup->lock);
+        __atomic_store_n(&newWakeup->lockedProtocol, 1, __ATOMIC_RELEASE);
+        __atomic_fetch_add(&newWakeup->sequence, 1, __ATOMIC_RELEASE);
+        pthread_cond_signal(&newWakeup->cond);
+        pthread_mutex_unlock(&newWakeup->lock);
+    } else {
+        // In case a signal was sent to the old mapping right before this swap.
+        pthread_cond_signal(newCond);
+    }
+
+    if (oldMapping)
+        munmap(oldMapping, oldMappingSize);
 
     return TRUE;
 }
@@ -471,7 +520,7 @@ static Bool lorieCursorFromMouse(DeviceIntPtr pDev) {
 void lorieSetCursorVisible(Bool visible) {
     pvfb->state->cursor.visible = visible;
     pvfb->state->cursor.moved = TRUE;
-    pthread_cond_signal(rendererCond);
+    lorieWakeRenderer();
 }
 
 static void lorieMoveCursor(DeviceIntPtr pDev, unused ScreenPtr pScr, int x, int y) {
@@ -483,7 +532,7 @@ static void lorieMoveCursor(DeviceIntPtr pDev, unused ScreenPtr pScr, int x, int
     pvfb->state->cursor.moved = TRUE;
     // No need to explicitly lock the mutex, it will cause waiting for rendering to be finished.
     // We are simply signaling the renderer in the case if it sleeps.
-    pthread_cond_signal(rendererCond);
+    lorieWakeRenderer();
 }
 
 static void lorieConvertCursor(CursorPtr pCurs, uint32_t *data) {
@@ -581,7 +630,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     if (__atomic_load_n(&pvfb->state->presentFeedbackPending, __ATOMIC_ACQUIRE)) {
         __atomic_fetch_add(&pvfb->state->presentFeedbackPollSerial, 1,
                            __ATOMIC_RELEASE);
-        pthread_cond_signal(rendererCond);
+        lorieWakeRenderer();
     }
 
     if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
@@ -618,7 +667,7 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         // We do not explicitly lock the pvfb->state->lock here because we do not want to wait
         // for all drawing operations to be finished.
         // Renderer thread will check the `drawRequested` flag right before going to sleep.
-        pthread_cond_signal(rendererCond);
+        lorieWakeRenderer();
     }
 
     return TRUE;
@@ -800,7 +849,7 @@ static Bool lorieCreateScreenResources(ScreenPtr pScreen) {
         pvfb->state->rootWindowTextureID =
             LorieBuffer_description(rootBuffer)->id;
         pvfb->state->drawRequested = TRUE;
-        pthread_cond_signal(rendererCond);
+        lorieWakeRenderer();
     }
 
     return TRUE;
@@ -1419,7 +1468,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
         entry->rects[i] = (LorieGpuCopyRect) { box[i].x1, box[i].y1, box[i].x2, box[i].y2 };
 
     __atomic_store_n(&pvfb->state->gpuCopyQueue.writeIndex, writeIndex + 1, __ATOMIC_RELEASE); // release-publish entry writes above
-    pthread_cond_signal(rendererCond);
+    lorieWakeRenderer();
 
     *out_serial = entry->serial;
     gpuCopyAttempts++;
