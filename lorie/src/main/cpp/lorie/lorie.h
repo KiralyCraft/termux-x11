@@ -25,6 +25,8 @@
  */
 #define LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE (1u << 29)
 #define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
+/* Protocol name retained for the matching Mesa loader.  At this checkpoint it
+ * advertises API-33 Choreographer vsync timestamps, not a deadline transport. */
 #define LORIE_PRESENT_CAP_FRAME_TIMELINE          (1u << 31)
 
 #ifdef __cplusplus

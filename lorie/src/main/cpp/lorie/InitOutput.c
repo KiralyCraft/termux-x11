@@ -90,9 +90,6 @@ typedef struct {
     pthread_mutex_t vblank_lock;
     uint64_t pending_vblanks;
     uint64_t pending_vblank_ust;
-    int64_t pending_timeline_deadline_ns;
-    int64_t pending_timeline_expected_ns;
-    int64_t pending_timeline_vsync_id;
     Bool redraw_queued;
 
     uint64_t gpuCopySerialCounter;
@@ -119,11 +116,6 @@ static char **xstartupArgv = NULL;
 typedef struct {
     void (*postVsyncCallback)(AChoreographer *, AChoreographer_vsyncCallback, void *);
     int64_t (*getFrameTimeNanos)(const AChoreographerFrameCallbackData *);
-    size_t (*getFrameTimelinesLength)(const AChoreographerFrameCallbackData *);
-    size_t (*getPreferredFrameTimelineIndex)(const AChoreographerFrameCallbackData *);
-    int64_t (*getFrameTimelineDeadlineNanos)(const AChoreographerFrameCallbackData *, size_t);
-    int64_t (*getFrameTimelineExpectedPresentationTimeNanos)(const AChoreographerFrameCallbackData *, size_t);
-    AVsyncId (*getFrameTimelineVsyncId)(const AChoreographerFrameCallbackData *, size_t);
     Bool available;
 } LorieChoreographerApi;
 
@@ -815,19 +807,13 @@ static void lorieWorkingQueueCallback(int fd, int __unused ready, void __unused 
     eventfd_read(fd, &dummy);
 }
 
-static void lorieQueueChoreographerVblank(uint64_t ust,
-                                          int64_t deadlineNs,
-                                          int64_t expectedNs,
-                                          int64_t vsyncId) {
+static void lorieQueueChoreographerVblank(uint64_t ust) {
     Bool queueRedraw = FALSE;
 
     if (pScreenPtr) {
         pthread_mutex_lock(&pvfb->vblank_lock);
         pvfb->pending_vblanks++;
         pvfb->pending_vblank_ust = ust;
-        pvfb->pending_timeline_deadline_ns = deadlineNs;
-        pvfb->pending_timeline_expected_ns = expectedNs;
-        pvfb->pending_timeline_vsync_id = vsyncId;
         if (!pvfb->redraw_queued) {
             pvfb->redraw_queued = TRUE;
             queueRedraw = TRUE;
@@ -856,30 +842,20 @@ static void lorieChoreographerFrameCallback(__unused long frameTimeNanos, void *
     /* The API-24 callback uses C long, which is only 32 bits on armeabi-v7a.
      * Preserve the established monotonic server timestamp on this fallback
      * instead of treating that truncated value as nanoseconds. */
-    lorieQueueChoreographerVblank(GetTimeInMicros(), 0, 0, -1);
+    lorieQueueChoreographerVblank(GetTimeInMicros());
 }
 
 static void lorieChoreographerVsyncCallback(const AChoreographerFrameCallbackData *callbackData,
                                              void *data) {
     AChoreographer *choreographer = data;
-    size_t count, preferred;
-    int64_t frameTimeNs, deadlineNs = 0, expectedNs = 0, vsyncId = -1;
+    int64_t frameTimeNs;
 
     lorieChoreographerApi.postVsyncCallback(choreographer,
                                             lorieChoreographerVsyncCallback,
                                             choreographer);
 
     frameTimeNs = lorieChoreographerApi.getFrameTimeNanos(callbackData);
-    count = lorieChoreographerApi.getFrameTimelinesLength(callbackData);
-    preferred = lorieChoreographerApi.getPreferredFrameTimelineIndex(callbackData);
-    if (preferred < count) {
-        deadlineNs = lorieChoreographerApi.getFrameTimelineDeadlineNanos(callbackData, preferred);
-        expectedNs = lorieChoreographerApi.getFrameTimelineExpectedPresentationTimeNanos(callbackData, preferred);
-        vsyncId = lorieChoreographerApi.getFrameTimelineVsyncId(callbackData, preferred);
-    }
-
-    lorieQueueChoreographerVblank((uint64_t) frameTimeNs / 1000,
-                                  deadlineNs, expectedNs, vsyncId);
+    lorieQueueChoreographerVblank((uint64_t) frameTimeNs / 1000);
 }
 
 void lorieChoreographerStart(AChoreographer *choreographer) {
@@ -887,28 +863,17 @@ void lorieChoreographerStart(AChoreographer *choreographer) {
     lorieChoreographerApi.member = dlsym(RTLD_DEFAULT, symbol)
     LOAD_CHOREOGRAPHER_SYMBOL(postVsyncCallback, "AChoreographer_postVsyncCallback");
     LOAD_CHOREOGRAPHER_SYMBOL(getFrameTimeNanos, "AChoreographerFrameCallbackData_getFrameTimeNanos");
-    LOAD_CHOREOGRAPHER_SYMBOL(getFrameTimelinesLength, "AChoreographerFrameCallbackData_getFrameTimelinesLength");
-    LOAD_CHOREOGRAPHER_SYMBOL(getPreferredFrameTimelineIndex, "AChoreographerFrameCallbackData_getPreferredFrameTimelineIndex");
-    LOAD_CHOREOGRAPHER_SYMBOL(getFrameTimelineDeadlineNanos, "AChoreographerFrameCallbackData_getFrameTimelineDeadlineNanos");
-    LOAD_CHOREOGRAPHER_SYMBOL(getFrameTimelineExpectedPresentationTimeNanos,
-                              "AChoreographerFrameCallbackData_getFrameTimelineExpectedPresentationTimeNanos");
-    LOAD_CHOREOGRAPHER_SYMBOL(getFrameTimelineVsyncId, "AChoreographerFrameCallbackData_getFrameTimelineVsyncId");
 #undef LOAD_CHOREOGRAPHER_SYMBOL
 
     lorieChoreographerApi.available =
         lorieChoreographerApi.postVsyncCallback &&
-        lorieChoreographerApi.getFrameTimeNanos &&
-        lorieChoreographerApi.getFrameTimelinesLength &&
-        lorieChoreographerApi.getPreferredFrameTimelineIndex &&
-        lorieChoreographerApi.getFrameTimelineDeadlineNanos &&
-        lorieChoreographerApi.getFrameTimelineExpectedPresentationTimeNanos &&
-        lorieChoreographerApi.getFrameTimelineVsyncId;
+        lorieChoreographerApi.getFrameTimeNanos;
 
     if (lorieChoreographerApi.available) {
         lorieChoreographerApi.postVsyncCallback(choreographer,
                                                 lorieChoreographerVsyncCallback,
                                                 choreographer);
-        log(INFO, "Using API-33 Choreographer frame timelines for Present pacing");
+        log(INFO, "Using API-33 Choreographer vsync timestamps for Present pacing");
     } else {
         AChoreographer_postFrameCallback(choreographer,
                                          lorieChoreographerFrameCallback,

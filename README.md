@@ -5,6 +5,26 @@
 
 A [Termux](https://termux.com) X11 server add-on app.
 
+## KGSL paced-Present compatibility
+
+The `fix/present-vblank-pacing-minimal` branch is the minimal Termux:X11 side
+of the tested KGSL paced-Present pair.  It preserves the behaviour validated at
+Termux:X11 commit `a30a4defe9bb70aec2169244e524e67a52cfcd55`, with unused
+future deadline-transport groundwork removed.
+
+Use it with the Mesa branch
+[`kgsl-present-wait-fence-paced`](https://github.com/KiralyCraft/mesa-for-android-container/tree/kgsl-present-wait-fence-paced)
+pinned to commit
+[`dcb971f9cdaa69587f1e3c92e85915e421827239`](https://github.com/KiralyCraft/mesa-for-android-container/commit/dcb971f9cdaa69587f1e3c92e85915e421827239).
+That exact SHA, rather than the moving branch tip, is the matching validated
+Mesa implementation.
+
+This branch intentionally excludes consumer-owned allocation, Android
+presentation-feedback transport, renderer-capacity IPC, custom deadline and
+opportunity publication, GMEM allocation padding, and SurfaceControl direct
+presentation.  API-33 Choreographer entry points are resolved at run time;
+older Android versions retain the compatibility callback path.
+
 ## About
 Termux:X11 is a fully fledged X server. It is built with Android NDK and optimized to be used with Termux.
 
