@@ -77,7 +77,9 @@ LorieBuffer* _Nullable LorieBuffer_allocate(int32_t width, int32_t height, int8_
 
 /**
  * DEBUG: Allocate an AHardwareBuffer with an explicit consumer contract.
- * Used only by the negotiated consumer-owned render-target experiment.
+ * Used only by the negotiated consumer-owned render-target experiment.  The
+ * returned LorieBuffer retains the requested logical dimensions even when
+ * the Android allocation is padded to meet the producer's row requirements.
  */
 LorieBuffer* _Nullable LorieBuffer_allocateAHardwareBuffer(int32_t width, int32_t height,
                                                             int8_t format, uint64_t usage);

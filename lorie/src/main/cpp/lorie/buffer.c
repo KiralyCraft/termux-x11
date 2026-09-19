@@ -218,9 +218,14 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocate(int32_t width, int32_t height,
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocateAHardwareBuffer(int32_t width, int32_t height,
                                                                   int8_t format, uint64_t usage) {
     AHardwareBuffer *buffer = NULL;
+    /* DEBUG: Freedreno's A6xx/A7xx linear GMEM store may access a final
+     * four-row block.  Consumer-owned buffers therefore need physical
+     * storage through align(height, 4), while X and the renderer must keep
+     * using the application's logical height. */
+    uint32_t allocation_height = ((uint32_t) height + 3U) & ~3U;
     AHardwareBuffer_Desc desc = {
         .width = (uint32_t) width,
-        .height = (uint32_t) height,
+        .height = allocation_height,
         .layers = 1,
         .format = (uint32_t) format,
         .usage = usage,
@@ -232,8 +237,14 @@ __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_allocateAHardwareBuffer(int32_t width, 
     if (err != 0 || !buffer)
         return NULL;
 
-    return allocate(width, width, height, format, LORIEBUFFER_AHARDWAREBUFFER,
-                    buffer, -1, 0, 0, true);
+    LorieBuffer *result = allocate(width, width, height, format,
+                                   LORIEBUFFER_AHARDWAREBUFFER, buffer,
+                                   -1, 0, 0, true);
+    if (result) {
+        result->desc.width = width;
+        result->desc.height = height;
+    }
+    return result;
 }
 
 __LIBC_HIDDEN__ LorieBuffer* LorieBuffer_wrapFileDescriptor(int32_t width, int32_t stride, int32_t height, int8_t format, int fd, off_t offset) {

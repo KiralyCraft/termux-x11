@@ -1831,8 +1831,11 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
         const LorieBuffer_Desc *allocated = LorieBuffer_description(priv->buffer);
         LorieBuffer_describeAHardwareBuffer(allocated->buffer, &allocation_desc);
         reply.status = 0;
-        reply.width = allocation_desc.width;
-        reply.height = allocation_desc.height;
+        /* Protocol v1 reports the logical pixmap size and the physical row
+         * stride.  The retained AHardwareBuffer can be taller so its dma-buf
+         * satisfies the producer's safe linear-store footprint. */
+        reply.width = width;
+        reply.height = height;
         reply.stride = allocation_desc.stride;
         reply.format = allocation_desc.format;
         reply.usage = allocation_desc.usage;
@@ -1843,12 +1846,12 @@ static PixmapPtr loriePixmapFromFds(ScreenPtr screen, CARD8 num_fds, const int *
               "DRI3: failed to send consumer-owned AHardwareBuffer handle");
         shutdown(fds[0], SHUT_WR);
 
-        screen->ModifyPixmapHeader(pixmap, allocation_desc.width,
-                                   allocation_desc.height, 0, 0,
+        screen->ModifyPixmapHeader(pixmap, width, height, 0, 0,
                                    allocation_desc.stride * 4, NULL);
         if (lorieServerDebugEnabled)
-            log(INFO, "DEBUG: allocated consumer-owned AHardwareBuffer %ux%u stride %u usage 0x%llx",
-                reply.width, reply.height, reply.stride,
+            log(INFO, "DEBUG: allocated consumer-owned AHardwareBuffer logical %ux%u allocation %ux%u stride %u usage 0x%llx",
+                reply.width, reply.height, allocation_desc.width,
+                allocation_desc.height, reply.stride,
                 (unsigned long long) reply.usage);
         return pixmap;
     }
