@@ -208,12 +208,12 @@ index 271fe32bc8b389498171dc572f17f5cd611ff167..560e24b1614ec9bf0dd9c49a87f05069
 -                          target_msc, divisor, remainder, NULL, 0);
 +                          target_msc, divisor, remainder, NULL, 0, NULL);
 diff --git a/present/present_event.c b/present/present_event.c
-index 849732dc880c4627ff80ae8eed6d3794d906e2d6..29b04f2f293ae68afba14c3c0733b5418b5f2f3e 100644
+index 849732dc880c4627ff80ae8eed6d3794d906e2d6..eddea16c6d974b1579cb536de67fc73f719c48da 100644
 --- a/present/present_event.c
 +++ b/present/present_event.c
 @@ -25,0 +26 @@ static RESTYPE present_event_type;
 +static uint64_t present_lorie_event_generation;
-@@ -178,0 +180,69 @@ present_send_complete_notify(WindowPtr window, CARD8 kind, CARD8 mode, CARD32 se
+@@ -178,0 +180,112 @@ present_send_complete_notify(WindowPtr window, CARD8 kind, CARD8 mode, CARD32 se
 +/* Private, capability-negotiated delivery to the exact event selection which
 + * opted in.  Standard CompleteNotify remains broadcast according to the
 + * Present protocol; this additional kind must never reach legacy clients. */
@@ -283,12 +283,55 @@ index 849732dc880c4627ff80ae8eed6d3794d906e2d6..29b04f2f293ae68afba14c3c0733b541
 +    return FALSE;
 +}
 +
-@@ -249,0 +320,3 @@ present_select_input(ClientPtr client, XID eid, WindowPtr window, CARD32 mask)
++/* Private backend-capacity feedback.  This says only that the renderer has
++ * finished sampling, or terminally retired, the root contents for this
++ * Present.  It is not presentation or allocation-release feedback. */
++Bool
++present_lorie_send_backend_release_notify(
++    WindowPtr window, const present_lorie_feedback_target_rec *target,
++    CARD8 mode, CARD32 serial, uint64_t tag)
++{
++    present_window_priv_ptr window_priv = present_window_priv(window);
++    present_event_ptr event;
++
++    if (!window_priv || !target || !target->eid ||
++        window_priv->lorie_generation != target->window_generation)
++        return FALSE;
++
++    for (event = window_priv->events; event; event = event->next) {
++        xPresentCompleteNotify cn;
++
++        if (event->id != target->eid ||
++            event->lorie_generation != target->event_generation ||
++            !(event->mask & PresentCompleteNotifyMask))
++            continue;
++
++        cn = (xPresentCompleteNotify) {
++            .type = GenericEvent,
++            .extension = present_request,
++            .length = (sizeof(xPresentCompleteNotify) - 32) >> 2,
++            .evtype = PresentCompleteNotify,
++            .kind = LoriePresentCompleteKindBackendRelease,
++            .mode = mode,
++            .eid = event->id,
++            .window = window->drawable.id,
++            .serial = serial,
++            .ust = 0,
++            .msc = tag,
++        };
++        WriteEventsToClient(event->client, 1, (xEvent *) &cn);
++        return TRUE;
++    }
++
++    return FALSE;
++}
++
+@@ -249,0 +363,3 @@ present_select_input(ClientPtr client, XID eid, WindowPtr window, CARD32 mask)
 +    event->lorie_generation = ++present_lorie_event_generation;
 +    if (!event->lorie_generation)
 +        event->lorie_generation = ++present_lorie_event_generation;
 diff --git a/present/present_execute.c b/present/present_execute.c
-index 68a5878be9c3f9698e4905c36965cf1e5b6efc89..b97dadf7f749c5714a89610b4a44818159f18678 100644
+index 68a5878be9c3f9698e4905c36965cf1e5b6efc89..0d31323eea1d7e2b431afc508bb1dc9a3c2bc6fd 100644
 --- a/present/present_execute.c
 +++ b/present/present_execute.c
 @@ -35,0 +36,2 @@ present_wait_fence_triggered(void *param)
@@ -303,7 +346,7 @@ index 68a5878be9c3f9698e4905c36965cf1e5b6efc89..b97dadf7f749c5714a89610b4a448181
 +    /* lorie: renderer can be connected but still unable to ever finish a pending GPU copy
 +     * (e.g. activity backgrounded, no surface) - completedSerial won't advance either way. */
 +    Bool                         gpuCopyStalled = !lorieConnectionAlive() || !lorieRendererAvailable();
-@@ -82 +92,70 @@ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
+@@ -82 +92,73 @@ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
 -    present_copy_region(&window->drawable, vblank->pixmap, vblank->update, vblank->x_off, vblank->y_off);
 +    /* lorie: a GPU copy was already scheduled; poll for completion instead of blocking. */
 +    if (vblank->gpu_copy_pending && !lorieGpuCopyIsDone(vblank->gpu_copy_serial) &&
@@ -314,7 +357,8 @@ index 68a5878be9c3f9698e4905c36965cf1e5b6efc89..b97dadf7f749c5714a89610b4a448181
 +    }
 +
 +    if (!vblank->lorie_present_tag)
-+        vblank->lorie_present_tag = loriePreparePresentTag(window, gpuCopyDst);
++        vblank->lorie_present_tag = loriePreparePresentTag(
++            window, gpuCopyDst, vblank->lorie_feedback.options);
 +
 +    if (vblank->gpu_copy_pending) {
 +        lorieGpuCopyAck(vblank->pixmap, vblank->gpu_copy_dst_buffer);
@@ -332,6 +376,7 @@ index 68a5878be9c3f9698e4905c36965cf1e5b6efc89..b97dadf7f749c5714a89610b4a448181
 +                                        vblank->lorie_feedback.eid,
 +                                        vblank->lorie_feedback.window_generation,
 +                                        vblank->lorie_feedback.event_generation,
++                                        vblank->lorie_feedback.options,
 +                                        &vblank->gpu_copy_serial, &vblank->gpu_copy_dst_buffer)) {
 +        if (vblank->lorie_present_tag)
 +            vblank->lorie_feedback_handed_off = TRUE;
@@ -366,7 +411,8 @@ index 68a5878be9c3f9698e4905c36965cf1e5b6efc89..b97dadf7f749c5714a89610b4a448181
 +                               window->drawable.id, vblank->serial,
 +                               vblank->lorie_feedback.eid,
 +                               vblank->lorie_feedback.window_generation,
-+                               vblank->lorie_feedback.event_generation);
++                               vblank->lorie_feedback.event_generation,
++                               vblank->lorie_feedback.options);
 +        if (vblank->lorie_present_tag)
 +            vblank->lorie_feedback_handed_off = TRUE;
 +
@@ -375,33 +421,39 @@ index 68a5878be9c3f9698e4905c36965cf1e5b6efc89..b97dadf7f749c5714a89610b4a448181
 +         */
 +        vblank->update = NULL;
 +    }
-@@ -84,4 +162,0 @@ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
+@@ -84,4 +165,0 @@ present_execute_copy(present_vblank_ptr vblank, uint64_t crtc_msc)
 -    /* present_copy_region sticks the region into a scratch GC,
 -     * which is then freed, freeing the region
 -     */
 -    vblank->update = NULL;
 diff --git a/present/present_priv.h b/present/present_priv.h
-index 4ad729864759ce67668545299f355337540386eb..778ebeb189d396d2690a60f4d182ce2ec3902c40 100644
+index 4ad729864759ce67668545299f355337540386eb..2ca1c5ca01979d7d3ad03716f249e8c527d3dbc8 100644
 --- a/present/present_priv.h
 +++ b/present/present_priv.h
 @@ -26,0 +27 @@
 +#include <stdbool.h>
-@@ -50,0 +52,7 @@
+@@ -50,0 +52,12 @@
 +/* Private Termux:X11 protocol negotiated through QueryCapabilities. */
++#define LoriePresentCapabilityBackendRelease (1U << 27)
 +#define LoriePresentCapabilityActualFeedback (1U << 28)
++#define LoriePresentOptionBackendRelease     (1U << 30)
 +#define LoriePresentOptionActualFeedback     (1U << 31)
 +#define LoriePresentCompleteKindActual       2
++#define LoriePresentCompleteKindBackendRelease 3
 +#define LoriePresentCompleteModeActual       1
 +#define LoriePresentCompleteModeUnknown      2
++#define LoriePresentBackendReleaseConsumed   1
++#define LoriePresentBackendReleaseRetired    2
 +
-@@ -58,0 +67,6 @@ typedef struct present_notify present_notify_rec, *present_notify_ptr;
+@@ -58,0 +72,7 @@ typedef struct present_notify present_notify_rec, *present_notify_ptr;
 +typedef struct {
 +    XID eid;
 +    uint64_t window_generation;
 +    uint64_t event_generation;
++    CARD32 options;
 +} present_lorie_feedback_target_rec;
 +
-@@ -92,0 +107,10 @@ struct present_vblank {
+@@ -92,0 +113,10 @@ struct present_vblank {
 +
 +    /* lorie: set when present_execute_copy offloaded the copy to the renderer's GPU context;
 +     * the vblank stays queued until the copy is acknowledged done. */
@@ -412,24 +464,26 @@ index 4ad729864759ce67668545299f355337540386eb..778ebeb189d396d2690a60f4d182ce2e
 +    present_lorie_feedback_target_rec lorie_feedback;
 +    Bool                lorie_feedback_handed_off;
 +    Bool                lorie_feedback_terminal_sent;
-@@ -94,0 +119,27 @@ struct present_vblank {
+@@ -94,0 +125,29 @@ struct present_vblank {
 +/* lorie: hooks implemented in lorie/InitOutput.c, used by present_execute_copy() to offload the
 + * pixmap->dst copy (dst being whatever GetWindowPixmap(window) is - root, or a Composite-redirected
 + * window's own backing pixmap) to the renderer's GPU context instead of a CPU CopyArea. */
 +extern Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, int16_t x_off, int16_t y_off,
 +                                     uint64_t present_tag, uint32_t present_window, uint32_t present_serial,
 +                                     uint32_t feedback_eid, uint64_t window_generation,
-+                                     uint64_t event_generation,
++                                     uint64_t event_generation, uint32_t present_options,
 +                                     uint64_t *out_serial, void **out_dst_buffer);
 +extern Bool lorieGpuCopyIsDone(uint64_t serial);
 +extern void lorieGpuCopyAck(PixmapPtr pixmap, void *dst_buffer);
 +/* DEBUG: application Present-to-Android-frame correlation.  These hooks only
 + * tag direct screen-pixmap content; they never signal readiness or ownership. */
-+extern uint64_t loriePreparePresentTag(WindowPtr window, PixmapPtr dst);
++extern uint64_t loriePreparePresentTag(WindowPtr window, PixmapPtr dst,
++                                       uint32_t options);
 +extern void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial,
 +                                   uint32_t feedback_eid,
 +                                   uint64_t window_generation,
-+                                   uint64_t event_generation);
++                                   uint64_t event_generation,
++                                   uint32_t options);
 +/* lorie: implemented in lorie/cmdentrypoint.c. Avoids waiting forever on a GPU copy that a dead renderer will never finish. */
 +extern bool lorieConnectionAlive(void);
 +/* lorie: implemented in lorie/InitOutput.c. Renderer can be connected but still unable to
@@ -440,19 +494,19 @@ index 4ad729864759ce67668545299f355337540386eb..778ebeb189d396d2690a60f4d182ce2e
 +/* lorie: implemented in present_scmd.c; re-executes any vblank whose GPU copy has finished. */
 +extern void lorieRecheckGpuCopies(void);
 +
-@@ -132 +183,2 @@ typedef int (*present_priv_pixmap_ptr)(WindowPtr window,
+@@ -132 +191,2 @@ typedef int (*present_priv_pixmap_ptr)(WindowPtr window,
 -                                       int num_notifies);
 +                                       int num_notifies,
 +                                       const present_lorie_feedback_target_rec *lorie_feedback);
-@@ -214,0 +267 @@ typedef struct present_event {
+@@ -214,0 +275 @@ typedef struct present_event {
 +    uint64_t lorie_generation;
-@@ -224,0 +278 @@ struct present_window_priv {
+@@ -224,0 +286 @@ struct present_window_priv {
 +    uint64_t               lorie_generation;
-@@ -298 +352,2 @@ present_pixmap(WindowPtr window,
+@@ -298 +360,2 @@ present_pixmap(WindowPtr window,
 -               int num_notifies);
 +               int num_notifies,
 +               const present_lorie_feedback_target_rec *lorie_feedback);
-@@ -319,0 +375,10 @@ present_send_complete_notify(WindowPtr window, CARD8 kind, CARD8 mode, CARD32 se
+@@ -319,0 +383,15 @@ present_send_complete_notify(WindowPtr window, CARD8 kind, CARD8 mode, CARD32 se
 +Bool
 +present_lorie_get_feedback_target(WindowPtr window, ClientPtr client,
 +                                  present_lorie_feedback_target_rec *target);
@@ -463,47 +517,60 @@ index 4ad729864759ce67668545299f355337540386eb..778ebeb189d396d2690a60f4d182ce2e
 +                                 CARD8 mode, CARD32 serial, uint64_t ust,
 +                                 uint64_t tag);
 +
-@@ -472 +537,2 @@ present_vblank_init(present_vblank_ptr vblank,
++Bool
++present_lorie_send_backend_release_notify(
++    WindowPtr window, const present_lorie_feedback_target_rec *target,
++    CARD8 mode, CARD32 serial, uint64_t tag);
++
+@@ -472 +550,2 @@ present_vblank_init(present_vblank_ptr vblank,
 -                    uint64_t crtc_msc);
 +                    uint64_t crtc_msc,
 +                    const present_lorie_feedback_target_rec *lorie_feedback);
-@@ -490 +556,2 @@ present_vblank_create(WindowPtr window,
+@@ -490 +569,2 @@ present_vblank_create(WindowPtr window,
 -                      uint64_t crtc_msc);
 +                      uint64_t crtc_msc,
 +                      const present_lorie_feedback_target_rec *lorie_feedback);
 diff --git a/present/present_request.c b/present/present_request.c
-index f3e5679b5d1c182d2a0e89b2a27506a000e7fdb7..418e30cff66baeab03834d6497ce4f95f229e20b 100644
+index f3e5679b5d1c182d2a0e89b2a27506a000e7fdb7..c02a22994bf3892672d1d17921d3a8602e4ba526 100644
 --- a/present/present_request.c
 +++ b/present/present_request.c
 @@ -94,0 +95,2 @@ proc_present_pixmap(ClientPtr client)
 +    present_lorie_feedback_target_rec lorie_feedback = { 0 };
 +    const present_lorie_feedback_target_rec *lorie_feedback_ptr = NULL;
-@@ -115 +117,2 @@ proc_present_pixmap(ClientPtr client)
+@@ -115 +117,3 @@ proc_present_pixmap(ClientPtr client)
 -    if (stuff->options & ~(PresentAllOptions)) {
 +    if (stuff->options & ~(PresentAllOptions |
++                           LoriePresentOptionBackendRelease |
 +                           LoriePresentOptionActualFeedback)) {
-@@ -119,0 +123,15 @@ proc_present_pixmap(ClientPtr client)
-+    if (stuff->options & LoriePresentOptionActualFeedback) {
+@@ -119,0 +124,22 @@ proc_present_pixmap(ClientPtr client)
++    if (stuff->options & (LoriePresentOptionBackendRelease |
++                          LoriePresentOptionActualFeedback)) {
 +        RRCrtcPtr capability_crtc = target_crtc ? target_crtc :
 +            present_get_crtc(window);
++        CARD32 capabilities = present_query_capabilities(capability_crtc);
 +
-+        if (!(present_query_capabilities(capability_crtc) &
-+              LoriePresentCapabilityActualFeedback)) {
++        if (((stuff->options & LoriePresentOptionBackendRelease) &&
++             !(capabilities & LoriePresentCapabilityBackendRelease)) ||
++            ((stuff->options & LoriePresentOptionActualFeedback) &&
++             !(capabilities & LoriePresentCapabilityActualFeedback))) {
 +            client->errorValue = stuff->options;
 +            return BadValue;
 +        }
 +        if (!present_lorie_get_feedback_target(window, client,
 +                                               &lorie_feedback))
 +            return BadMatch;
++        lorie_feedback.options = stuff->options &
++            (LoriePresentOptionBackendRelease |
++             LoriePresentOptionActualFeedback);
 +        lorie_feedback_ptr = &lorie_feedback;
 +    }
 +
-@@ -149 +167,2 @@ proc_present_pixmap(ClientPtr client)
+@@ -149 +175,2 @@ proc_present_pixmap(ClientPtr client)
 -                         stuff->target_msc, stuff->divisor, stuff->remainder, notifies, nnotifies);
 +                         stuff->target_msc, stuff->divisor, stuff->remainder,
 +                         notifies, nnotifies, lorie_feedback_ptr);
 diff --git a/present/present_scmd.c b/present/present_scmd.c
-index 239055bc10d8c934555356c4213cda37dbff711e..b993e64e09c19852f700da63d557cc6fe18c8155 100644
+index 239055bc10d8c934555356c4213cda37dbff711e..54a957a0c733e7419a775698d5b4541f2dbf34af 100644
 --- a/present/present_scmd.c
 +++ b/present/present_scmd.c
 @@ -254,0 +255,15 @@ present_flip_try_ready(ScreenPtr screen)
@@ -522,24 +589,26 @@ index 239055bc10d8c934555356c4213cda37dbff711e..b993e64e09c19852f700da63d557cc6f
 +    }
 +}
 +
-@@ -601,0 +617,12 @@ present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
+@@ -601,0 +617,14 @@ present_execute(present_vblank_ptr vblank, uint64_t ust, uint64_t crtc_msc)
 +                {
 +                    uint64_t lorie_present_tag = loriePreparePresentTag(
-+                        vblank->window, (*screen->GetScreenPixmap)(screen));
++                        vblank->window, (*screen->GetScreenPixmap)(screen),
++                        vblank->lorie_feedback.options);
 +                    loriePublishPresentTag(lorie_present_tag,
 +                                           vblank->window->drawable.id,
 +                                           vblank->serial,
 +                                           vblank->lorie_feedback.eid,
 +                                           vblank->lorie_feedback.window_generation,
-+                                           vblank->lorie_feedback.event_generation);
++                                           vblank->lorie_feedback.event_generation,
++                                           vblank->lorie_feedback.options);
 +                    if (lorie_present_tag)
 +                        vblank->lorie_feedback_handed_off = TRUE;
 +                }
-@@ -682 +709,2 @@ present_scmd_pixmap(WindowPtr window,
+@@ -682 +711,2 @@ present_scmd_pixmap(WindowPtr window,
 -                    int num_notifies)
 +                    int num_notifies,
 +                    const present_lorie_feedback_target_rec *lorie_feedback)
-@@ -763 +791,2 @@ present_scmd_pixmap(WindowPtr window,
+@@ -763 +793,2 @@ present_scmd_pixmap(WindowPtr window,
 -                                   crtc_msc);
 +                                   crtc_msc,
 +                                   lorie_feedback);
@@ -554,10 +623,10 @@ index 2c29aafd23509143b491cc9c6209234faa026b33..42c57618667f0ae00fb161a19276f914
 +    if (!window_priv->lorie_generation)
 +        window_priv->lorie_generation = ++present_lorie_window_generation;
 diff --git a/present/present_vblank.c b/present/present_vblank.c
-index a9f17d4b2be374257b44199959c5ae1beb2d3972..9d37a7e536d3ab472e3694e0566dfa7359802dca 100644
+index a9f17d4b2be374257b44199959c5ae1beb2d3972..7d3ac87dcd51ac84ae1e67caf7db7a805791ed5d 100644
 --- a/present/present_vblank.c
 +++ b/present/present_vblank.c
-@@ -24,0 +25,16 @@
+@@ -24,0 +25,25 @@
 +static void
 +present_lorie_retire_feedback_unknown(present_vblank_ptr vblank)
 +{
@@ -566,29 +635,38 @@ index a9f17d4b2be374257b44199959c5ae1beb2d3972..9d37a7e536d3ab472e3694e0566dfa73
 +        vblank->lorie_feedback_terminal_sent)
 +        return;
 +
-+    if (vblank->window)
-+        present_lorie_send_actual_notify(vblank->window,
-+                                         &vblank->lorie_feedback,
-+                                         LoriePresentCompleteModeUnknown,
-+                                         vblank->serial, 0, 0);
++    if (vblank->window) {
++        if (vblank->lorie_feedback.options &
++            LoriePresentOptionActualFeedback)
++            present_lorie_send_actual_notify(vblank->window,
++                                             &vblank->lorie_feedback,
++                                             LoriePresentCompleteModeUnknown,
++                                             vblank->serial, 0, 0);
++        if (vblank->lorie_feedback.options &
++            LoriePresentOptionBackendRelease)
++            present_lorie_send_backend_release_notify(
++                vblank->window, &vblank->lorie_feedback,
++                LoriePresentBackendReleaseRetired,
++                vblank->serial, 0);
++    }
 +    vblank->lorie_feedback_terminal_sent = TRUE;
 +}
 +
-@@ -63 +79,2 @@ present_vblank_init(present_vblank_ptr vblank,
+@@ -63 +88,2 @@ present_vblank_init(present_vblank_ptr vblank,
 -                    uint64_t crtc_msc)
 +                    uint64_t crtc_msc,
 +                    const present_lorie_feedback_target_rec *lorie_feedback)
-@@ -108,0 +126,2 @@ present_vblank_init(present_vblank_ptr vblank,
+@@ -108,0 +135,2 @@ present_vblank_init(present_vblank_ptr vblank,
 +    if (lorie_feedback)
 +        vblank->lorie_feedback = *lorie_feedback;
-@@ -166 +185,2 @@ present_vblank_create(WindowPtr window,
+@@ -166 +194,2 @@ present_vblank_create(WindowPtr window,
 -                      uint64_t crtc_msc)
 +                      uint64_t crtc_msc,
 +                      const present_lorie_feedback_target_rec *lorie_feedback)
-@@ -176 +196 @@ present_vblank_create(WindowPtr window,
+@@ -176 +205 @@ present_vblank_create(WindowPtr window,
 -                            target_msc, crtc_msc))
 +                            target_msc, crtc_msc, lorie_feedback))
-@@ -190,0 +211,10 @@ present_vblank_scrap(present_vblank_ptr vblank)
+@@ -190,0 +220,10 @@ present_vblank_scrap(present_vblank_ptr vblank)
 +    present_lorie_retire_feedback_unknown(vblank);
 +
 +    /* lorie: an offloaded copy into vblank->pixmap may still be in flight - ack it now, while
@@ -599,7 +677,7 @@ index a9f17d4b2be374257b44199959c5ae1beb2d3972..9d37a7e536d3ab472e3694e0566dfa73
 +        vblank->gpu_copy_pending = FALSE;
 +    }
 +
-@@ -202,0 +233,9 @@ present_vblank_destroy(present_vblank_ptr vblank)
+@@ -202,0 +242,9 @@ present_vblank_destroy(present_vblank_ptr vblank)
 +    present_lorie_retire_feedback_unknown(vblank);
 +
 +    /* lorie: same as in present_vblank_scrap() - must run before vblank->pixmap is dropped below,

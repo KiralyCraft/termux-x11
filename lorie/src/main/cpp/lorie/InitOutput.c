@@ -104,9 +104,6 @@ typedef struct {
     uint64_t gpuCopySerialCounter;
     uint64_t rootGpuCopyPending;
     uint64_t presentTagCounter;
-    uint64_t presentReadyPublishes;
-    uint64_t presentReadyWakeupsOutsideVblank;
-    Bool handlingVblank;
 
     /* DEBUG: aggregate actual Android display feedback without changing X
      * Present completion semantics. Updated from an X-server-thread work
@@ -641,7 +638,6 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     if (!pendingVblanks)
         return TRUE;
 
-    pvfb->handlingVblank = TRUE;
     pvfb->current_msc += pendingVblanks;
     if (pendingVblanks > 1)
         pvfb->coalesced_vblanks += pendingVblanks - 1;
@@ -663,15 +659,14 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
     }
 
     if (!lorieConnectionAlive() || !pvfb->state->surfaceAvailable)
-        goto out;
+        return TRUE;
 
     nonEmpty = RegionNotEmpty(DamageRegion(pvfb->damage));
     priv = root ? exaGetPixmapDriverPrivate(root) : NULL;
 
-    if (!priv) {
+    if (!priv)
         // Impossible situation, but let's skip this step
-        goto out;
-    }
+        return TRUE;
 
     if (nonEmpty && priv->buffer) {
         // We should unlock and lock buffer in order to update texture content on some devices
@@ -700,8 +695,6 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         lorieWakeRenderer();
     }
 
-out:
-    pvfb->handlingVblank = FALSE;
     return TRUE;
 }
 
@@ -752,12 +745,14 @@ void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
                 (unsigned long long) egl_frame_id, (long long) submit_ns);
     }
 
-    if (present_tag.feedbackEid && present_tag.window) {
+    if ((present_tag.options & LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK) &&
+        present_tag.feedbackEid && present_tag.window) {
         WindowPtr window = NULL;
         present_lorie_feedback_target_rec target = {
             .eid = present_tag.feedbackEid,
             .window_generation = present_tag.windowGeneration,
             .event_generation = present_tag.eventGeneration,
+            .options = present_tag.options,
         };
         CARD8 mode = status == LORIE_PRESENT_FEEDBACK_PRESENTED &&
                      present_ns > 0 ?
@@ -772,6 +767,28 @@ void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
                                              present_tag.serial, ust,
                                              present_tag.tag);
     }
+}
+
+void lorieHandlePresentBackendRelease(uint8_t mode,
+                                      LoriePresentTag present_tag) {
+    WindowPtr window = NULL;
+    present_lorie_feedback_target_rec target = {
+        .eid = present_tag.feedbackEid,
+        .window_generation = present_tag.windowGeneration,
+        .event_generation = present_tag.eventGeneration,
+        .options = present_tag.options,
+    };
+
+    if (!(present_tag.options & LORIE_PRESENT_OPTION_BACKEND_RELEASE) ||
+        !present_tag.feedbackEid || !present_tag.window ||
+        (mode != LORIE_PRESENT_BACKEND_RELEASE_CONSUMED &&
+         mode != LORIE_PRESENT_BACKEND_RELEASE_RETIRED))
+        return;
+
+    if (dixLookupWindow(&window, present_tag.window, serverClient,
+                        DixReadAccess) == Success)
+        present_lorie_send_backend_release_notify(
+            window, &target, mode, present_tag.serial, present_tag.tag);
 }
 
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
@@ -854,7 +871,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             actual ? (double) totalNs / (double) actual / 1000000.0 : 0.0,
             (double) maxNs / 1000000.0);
     if (swapCount || acquireCount)
-        log(INFO, "DEBUG: renderer capacity: swap %u mean %.3fms max %.3fms over-period %u; next-buffer %u mean %.3fms max %.3fms over-period %u; opportunity-advanced-during-draw %u; coalesced-vblanks %llu; present-ready-publishes %llu outside-vblank-wakes %llu",
+        log(INFO, "DEBUG: renderer capacity: swap %u mean %.3fms max %.3fms over-period %u; next-buffer %u mean %.3fms max %.3fms over-period %u; opportunity-advanced-during-draw %u; coalesced-vblanks %llu",
             swapCount,
             swapCount ? (double) swapTotalUs / (double) swapCount / 1000.0 : 0.0,
             (double) swapMaxUs / 1000.0, swapOverPeriod,
@@ -862,9 +879,7 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             acquireCount ? (double) acquireTotalUs / (double) acquireCount / 1000.0 : 0.0,
             (double) acquireMaxUs / 1000.0, acquireOverPeriod,
             opportunityAdvancedDuringDraw,
-            (unsigned long long) pvfb->coalesced_vblanks,
-            (unsigned long long) pvfb->presentReadyPublishes,
-            (unsigned long long) pvfb->presentReadyWakeupsOutsideVblank);
+            (unsigned long long) pvfb->coalesced_vblanks);
     if (presentTagReads || presentTagAdvances || presentTagEligible ||
         presentTagSuppressed || presentTagAttached)
         log(INFO, "DEBUG: renderer present tags: reads %u advances %u eligible %u suppressed %u attached %u; last published=%llu content=%llu submitted=%llu",
@@ -876,8 +891,6 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
     pvfb->coalesced_vblanks = 0;
-    pvfb->presentReadyPublishes = 0;
-    pvfb->presentReadyWakeupsOutsideVblank = 0;
     return 5000;
 }
 
@@ -1204,7 +1217,8 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
     pvfb->eventFd = eventFd;
     SetNotifyFd(eventFd, lorieWorkingQueueCallback, X_NOTIFY_READ, NULL);
 
-    loriePresentInfo.capabilities = LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE |
+    loriePresentInfo.capabilities = LORIE_PRESENT_CAP_BACKEND_RELEASE |
+                                    LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE |
                                     LORIE_PRESENT_CAP_VBLANK_COMPLETE;
     if (lorieChoreographerApi.available)
         loriePresentInfo.capabilities |= LORIE_PRESENT_CAP_FRAME_TIMELINE;
@@ -1365,11 +1379,13 @@ bool lorieRendererAvailable(void) {
  * write the screen pixmap sampled by the Android renderer.  Redirected window
  * backing pixmaps need a later compositor-aware correlation path; labelling
  * them as physically presented here would be false precision. */
-uint64_t loriePreparePresentTag(WindowPtr window, PixmapPtr dst) {
+uint64_t loriePreparePresentTag(WindowPtr window, PixmapPtr dst,
+                                uint32_t options) {
     PixmapPtr root;
 
     if (!window || !dst || !pvfb->state ||
-        !pvfb->state->presentFeedbackEnabled)
+        !(options & (LORIE_PRESENT_OPTION_BACKEND_RELEASE |
+                     LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK)))
         return 0;
     root = window->drawable.pScreen->GetScreenPixmap(window->drawable.pScreen);
     if (dst != root)
@@ -1387,7 +1403,8 @@ uint64_t loriePreparePresentTag(WindowPtr window, PixmapPtr dst) {
 void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial,
                             uint32_t feedback_eid,
                             uint64_t window_generation,
-                            uint64_t event_generation) {
+                            uint64_t event_generation,
+                            uint32_t options) {
     LoriePresentTag previous;
     uint64_t claimed_tag;
     uint32_t version;
@@ -1402,8 +1419,12 @@ void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial,
         claimed_tag != previous.tag) {
         __atomic_store_n(&pvfb->state->latestPresentTag.claimedTag,
                          previous.tag, __ATOMIC_RELEASE);
-        lorieHandlePresentFeedback(LORIE_PRESENT_FEEDBACK_UNKNOWN, 0, 0, 0,
-                                   previous, 0, 0, 0);
+        if (previous.options & LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK)
+            lorieHandlePresentFeedback(LORIE_PRESENT_FEEDBACK_UNKNOWN,
+                                       0, 0, 0, previous, 0, 0, 0);
+        if (previous.options & LORIE_PRESENT_OPTION_BACKEND_RELEASE)
+            lorieHandlePresentBackendRelease(
+                LORIE_PRESENT_BACKEND_RELEASE_RETIRED, previous);
     }
     version = __atomic_load_n(&pvfb->state->latestPresentTag.version,
                               __ATOMIC_RELAXED);
@@ -1423,33 +1444,11 @@ void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial,
                      __ATOMIC_RELAXED);
     __atomic_store_n(&pvfb->state->latestPresentTag.value.feedbackEid,
                      feedback_eid, __ATOMIC_RELAXED);
-    __atomic_store_n(&pvfb->state->latestPresentTag.value.reserved, 0,
+    __atomic_store_n(&pvfb->state->latestPresentTag.value.options, options,
                      __ATOMIC_RELAXED);
     __atomic_store_n(&pvfb->state->latestPresentTag.version, version + 2,
                      __ATOMIC_RELEASE);
 
-    /* DEBUG: A wait fence may become ready after lorieRedraw() has already
-     * checked root damage for this Choreographer opportunity.  At this point
-     * the producer dependency and the CPU copy/flip are complete, so publish
-     * the root storage identity and wake the renderer immediately.  The
-     * renderer's opportunity predicate still prevents a second submission in
-     * the same display opportunity. */
-    {
-        PixmapPtr root = pScreenPtr && pScreenPtr->root ?
-            pScreenPtr->GetWindowPixmap(pScreenPtr->root) : NULL;
-        LoriePixmapPriv *priv = root ? exaGetPixmapDriverPrivate(root) : NULL;
-
-        if (priv && priv->buffer) {
-            pvfb->state->rootWindowTextureID =
-                LorieBuffer_description(priv->buffer)->id;
-            pvfb->state->drawRequested = TRUE;
-            pvfb->presentReadyPublishes++;
-            if (!pvfb->handlingVblank) {
-                pvfb->presentReadyWakeupsOutsideVblank++;
-                lorieWakeRenderer();
-            }
-        }
-    }
     lorie_mutex_unlock(&pvfb->state->lock, &pvfb->state->lockingPid);
 }
 
@@ -1463,6 +1462,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
                               uint32_t present_serial, uint32_t feedback_eid,
                               uint64_t window_generation,
                               uint64_t event_generation,
+                              uint32_t present_options,
                               uint64_t *out_serial, void **out_dst_buffer) {
     LorieBuffer *srcBuffer, *dstBuffer;
     LoriePixmapPriv *priv;
@@ -1559,6 +1559,7 @@ Bool lorieTryScheduleGpuCopy(PixmapPtr pixmap, PixmapPtr dst, RegionPtr update, 
         .window = present_window,
         .serial = present_serial,
         .feedbackEid = feedback_eid,
+        .options = present_options,
     };
     entry->xOff = x_off;
     entry->yOff = y_off;

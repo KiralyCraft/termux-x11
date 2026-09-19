@@ -462,6 +462,26 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                 lorieWakeServer();
                 break;
             }
+            case EVENT_PRESENT_BACKEND_RELEASE: {
+                auto *copy = static_cast<lorieEvent*>(calloc(1, sizeof(lorieEvent)));
+                if (!copy)
+                    break;
+                *copy = e;
+                QueueWorkProc(+[](__unused ClientPtr pClient, void *closure) -> Bool {
+                    /* Routing and X resource generation checks must run on
+                     * the X server thread.  This event releases only the
+                     * backend-submission slot; it proves neither physical
+                     * presentation nor consumer storage release. */
+                    auto *event = static_cast<lorieEvent*>(closure);
+                    lorieHandlePresentBackendRelease(
+                        event->presentBackendRelease.mode,
+                        event->presentBackendRelease.presentTag);
+                    free(event);
+                    return TRUE;
+                }, nullptr, copy);
+                lorieWakeServer();
+                break;
+            }
             case EVENT_SYNC: {
                 auto serial = (uintptr_t) e.sync.serial;
                 QueueWorkProc(+[](__unused ClientPtr pClient, void *closure) -> Bool {

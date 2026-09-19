@@ -23,6 +23,7 @@
  * describe Termux:X11 implementation details; clients which do not know them
  * simply ignore them.
  */
+#define LORIE_PRESENT_CAP_BACKEND_RELEASE         (1u << 27)
 #define LORIE_PRESENT_CAP_ACTUAL_FEEDBACK         (1u << 28)
 #define LORIE_PRESENT_CAP_WAIT_FENCE_REQUEUE_SAFE (1u << 29)
 #define LORIE_PRESENT_CAP_VBLANK_COMPLETE         (1u << 30)
@@ -30,10 +31,14 @@
 
 /* Per-request opt-in.  The matching Mesa loader only sets this after the
  * capability above was advertised, so unmodified servers never see it. */
+#define LORIE_PRESENT_OPTION_BACKEND_RELEASE      (1u << 30)
 #define LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK      (1u << 31)
 #define LORIE_PRESENT_COMPLETE_KIND_ACTUAL        2
+#define LORIE_PRESENT_COMPLETE_KIND_BACKEND_RELEASE 3
 #define LORIE_PRESENT_COMPLETE_MODE_ACTUAL        1
 #define LORIE_PRESENT_COMPLETE_MODE_UNKNOWN       2
+#define LORIE_PRESENT_BACKEND_RELEASE_CONSUMED    1
+#define LORIE_PRESENT_BACKEND_RELEASE_RETIRED     2
 
 #define LORIE_PRESENT_FEEDBACK_PRESENTED 1
 #define LORIE_PRESENT_FEEDBACK_UNKNOWN   2
@@ -65,7 +70,7 @@ typedef struct __attribute__((aligned(8))) {
     uint32_t window;
     uint32_t serial;
     uint32_t feedbackEid;
-    uint32_t reserved;
+    uint32_t options;
 } LoriePresentTag;
 
 #ifdef __cplusplus
@@ -90,6 +95,8 @@ void lorieHandlePresentFeedback(uint8_t status, uint32_t surface_generation,
                                 LoriePresentTag present_tag,
                                 uint64_t egl_frame_id, int64_t submit_ns,
                                 int64_t present_ns);
+void lorieHandlePresentBackendRelease(uint8_t mode,
+                                      LoriePresentTag present_tag);
 void lorieChoreographerStart(AChoreographer *choreographer);
 void lorieActivityConnected(void);
 void lorieSendSharedServerState(int memfd);
@@ -171,6 +178,7 @@ typedef enum {
     EVENT_LOCK_KEYS_STATE,
     EVENT_SYNC,
     EVENT_SYNC_REPLY,
+    EVENT_PRESENT_BACKEND_RELEASE,
 } eventType;
 
 typedef union {
@@ -238,6 +246,12 @@ typedef union {
         int64_t submitNs;
         int64_t presentNs;
     } presentFeedback;
+    struct {
+        uint8_t t;
+        uint8_t mode;
+        uint16_t reserved;
+        LoriePresentTag presentTag;
+    } presentBackendRelease;
     struct {
         uint8_t t;
         uint32_t serial;
@@ -525,6 +539,8 @@ struct Renderer {
                                int64_t submitNs, EGLuint64KHR eglFrameId);
     void notifyPresentFeedback(const PendingPresentFeedback& pending,
                                uint8_t status, int64_t presentNs) const;
+    void notifyPresentBackendRelease(const LoriePresentTag& presentTag,
+                                     uint8_t mode) const;
     void reportViewport(int dstX, int dstY, int dstW, int dstH, float left, float top, float width, float height);
     void drawRegion(GLuint id, float x0, float y0, float x1, float y1, float u0, float v0, float u1, float v1, uint8_t flip);
     void drawCursor(float displayWidth, float displayHeight, float sourceLeft, float sourceTop, float cursorX, float cursorY);

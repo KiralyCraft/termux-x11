@@ -135,8 +135,8 @@ static bool readPublishedPresentTag(const lorie_shared_server_state* state,
         out->feedbackEid = __atomic_load_n(
             &state->latestPresentTag.value.feedbackEid,
             __ATOMIC_RELAXED);
-        out->reserved = __atomic_load_n(
-            &state->latestPresentTag.value.reserved,
+        out->options = __atomic_load_n(
+            &state->latestPresentTag.value.options,
             __ATOMIC_RELAXED);
         after = __atomic_load_n(&state->latestPresentTag.version,
                                 __ATOMIC_ACQUIRE);
@@ -382,6 +382,19 @@ void Renderer::notifyPresentFeedback(const PendingPresentFeedback& pending,
     write(*connFdPtr, &event, sizeof(event));
 }
 
+void Renderer::notifyPresentBackendRelease(
+    const LoriePresentTag& presentTag, uint8_t mode) const {
+    if (!connFdPtr || *connFdPtr == -1 || !presentTag.tag ||
+        !(presentTag.options & LORIE_PRESENT_OPTION_BACKEND_RELEASE))
+        return;
+
+    lorieEvent event{};
+    event.presentBackendRelease.t = EVENT_PRESENT_BACKEND_RELEASE;
+    event.presentBackendRelease.mode = mode;
+    event.presentBackendRelease.presentTag = presentTag;
+    write(*connFdPtr, &event, sizeof(event));
+}
+
 void Renderer::retirePresentTagUnknown(const LoriePresentTag& presentTag,
                                        uint64_t gpuCopySerial) {
     PendingPresentFeedback pending{};
@@ -389,7 +402,8 @@ void Renderer::retirePresentTagUnknown(const LoriePresentTag& presentTag,
     if (!presentTag.tag || presentTag.tag <= lastSubmittedPresentTag)
         return;
 
-    if (presentTag.feedbackEid) {
+    if ((presentTag.options & LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK) &&
+        presentTag.feedbackEid) {
         pending.valid = true;
         pending.surfaceGeneration = presentFeedbackSurfaceGeneration;
         pending.rendererSerial = ++rendererPresentSerial;
@@ -438,8 +452,11 @@ void Renderer::configurePresentFeedbackSurface() {
     }
     /* Content which predates this Android surface is not attributed to a new
      * application frame merely because the surface needs its initial redraw. */
-    if (retireCurrent)
+    if (retireCurrent) {
+        notifyPresentBackendRelease(
+            current, LORIE_PRESENT_BACKEND_RELEASE_RETIRED);
         retirePresentTagUnknown(current);
+    }
     if (latestContentPresentTag.tag > lastSubmittedPresentTag)
         lastSubmittedPresentTag = latestContentPresentTag.tag;
     presentFeedbackPollSerialSeen = state
@@ -1353,8 +1370,12 @@ uint64_t Renderer::applyPendingGpuCopiesLocked() {
                 uint64_t claimedCpuTag = state ?
                     __atomic_load_n(&state->latestPresentTag.claimedTag,
                                     __ATOMIC_ACQUIRE) : 0;
-                if (latestContentPresentTag.tag != claimedCpuTag)
+                if (latestContentPresentTag.tag != claimedCpuTag) {
+                    notifyPresentBackendRelease(
+                        latestContentPresentTag,
+                        LORIE_PRESENT_BACKEND_RELEASE_RETIRED);
                     retirePresentTagUnknown(latestContentPresentTag);
+                }
                 latestContentPresentTag = entry.presentTag;
             }
         }
@@ -1549,8 +1570,12 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
 
         if (claimedCpuTag != publishedPresentTag.tag) {
             if (publishedPresentTag.tag > latestContentPresentTag.tag) {
-                if (latestContentPresentTag.tag != claimedCpuTag)
+                if (latestContentPresentTag.tag != claimedCpuTag) {
+                    notifyPresentBackendRelease(
+                        latestContentPresentTag,
+                        LORIE_PRESENT_BACKEND_RELEASE_RETIRED);
                     retirePresentTagUnknown(latestContentPresentTag);
+                }
                 latestContentPresentTag = publishedPresentTag;
                 if (state->rendererTimingEnabled)
                     __atomic_fetch_add(
@@ -1558,6 +1583,9 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
                         __ATOMIC_RELAXED);
             } else if (publishedPresentTag.tag <
                        latestContentPresentTag.tag) {
+                notifyPresentBackendRelease(
+                    publishedPresentTag,
+                    LORIE_PRESENT_BACKEND_RELEASE_RETIRED);
                 retirePresentTagUnknown(publishedPresentTag);
             }
             __atomic_store_n(&state->latestPresentTag.claimedTag,
@@ -1652,9 +1680,17 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
 
     if (swapResult != EGL_TRUE) {
         printEglError("Failed to swap buffers", __LINE__);
+        notifyPresentBackendRelease(
+            framePresentTag, LORIE_PRESENT_BACKEND_RELEASE_RETIRED);
         retirePresentTagUnknown(framePresentTag, gpuCopySerial);
     } else {
-        if (framePresentTag.tag && trackPresent) {
+        notifyPresentBackendRelease(
+            framePresentTag, LORIE_PRESENT_BACKEND_RELEASE_CONSUMED);
+        if (framePresentTag.tag && !trackPresent &&
+            (framePresentTag.options &
+             LORIE_PRESENT_OPTION_ACTUAL_FEEDBACK)) {
+            retirePresentTagUnknown(framePresentTag, gpuCopySerial);
+        } else if (framePresentTag.tag) {
             lastSubmittedPresentTag = framePresentTag.tag;
             if (state->rendererTimingEnabled) {
                 __atomic_fetch_add(&state->rendererTiming.presentTagAttached,
@@ -1667,8 +1703,6 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
         if (trackPresent)
             recordPresentFeedback(gpuCopySerial, framePresentTag, submitNs,
                                   eglFrameId);
-        else
-            retirePresentTagUnknown(framePresentTag, gpuCopySerial);
     }
 
     // Perform a little drawing operation to make sure the next buffer is ready on the next invocation of drawing
