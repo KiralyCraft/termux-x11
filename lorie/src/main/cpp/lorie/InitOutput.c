@@ -779,6 +779,10 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     uint32_t swapCount, swapTotalUs, swapMaxUs, swapOverPeriod;
     uint32_t acquireCount, acquireTotalUs, acquireMaxUs, acquireOverPeriod;
     uint32_t opportunityAdvancedDuringDraw;
+    uint32_t presentTagReads, presentTagAdvances, presentTagEligible;
+    uint32_t presentTagSuppressed, presentTagAttached;
+    uint64_t lastPublishedPresentTag, lastContentPresentTag;
+    uint64_t lastSubmittedPresentTag;
 
     pthread_mutex_lock(&pvfb->presentFeedbackLock);
     actual = pvfb->presentFeedbackPresented;
@@ -815,6 +819,27 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
     opportunityAdvancedDuringDraw = __atomic_exchange_n(
         &pvfb->state->rendererTiming.opportunityAdvancedDuringDraw, 0,
         __ATOMIC_ACQ_REL);
+    presentTagReads = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.presentTagReads, 0, __ATOMIC_ACQ_REL);
+    presentTagAdvances = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.presentTagAdvances, 0, __ATOMIC_ACQ_REL);
+    presentTagEligible = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.presentTagEligible, 0, __ATOMIC_ACQ_REL);
+    presentTagSuppressed = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.presentTagSuppressed, 0,
+        __ATOMIC_ACQ_REL);
+    presentTagAttached = __atomic_exchange_n(
+        &pvfb->state->rendererTiming.presentTagAttached, 0,
+        __ATOMIC_ACQ_REL);
+    lastPublishedPresentTag = __atomic_load_n(
+        &pvfb->state->rendererTiming.lastPublishedPresentTag,
+        __ATOMIC_ACQUIRE);
+    lastContentPresentTag = __atomic_load_n(
+        &pvfb->state->rendererTiming.lastContentPresentTag,
+        __ATOMIC_ACQUIRE);
+    lastSubmittedPresentTag = __atomic_load_n(
+        &pvfb->state->rendererTiming.lastSubmittedPresentTag,
+        __ATOMIC_ACQUIRE);
 
     if (pvfb->state->renderedFrames || gpuCopyAttempts)
         log(INFO, gpuCopyAttempts ? "%d frames in 5.0 seconds = %.1f FPS, %llu/%llu present copies offloaded to GPU"
@@ -840,6 +865,14 @@ static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unu
             (unsigned long long) pvfb->coalesced_vblanks,
             (unsigned long long) pvfb->presentReadyPublishes,
             (unsigned long long) pvfb->presentReadyWakeupsOutsideVblank);
+    if (presentTagReads || presentTagAdvances || presentTagEligible ||
+        presentTagSuppressed || presentTagAttached)
+        log(INFO, "DEBUG: renderer present tags: reads %u advances %u eligible %u suppressed %u attached %u; last published=%llu content=%llu submitted=%llu",
+            presentTagReads, presentTagAdvances, presentTagEligible,
+            presentTagSuppressed, presentTagAttached,
+            (unsigned long long) lastPublishedPresentTag,
+            (unsigned long long) lastContentPresentTag,
+            (unsigned long long) lastSubmittedPresentTag);
     pvfb->state->renderedFrames = 0;
     gpuCopyAttempts = gpuCopyOffloads = 0;
     pvfb->coalesced_vblanks = 0;

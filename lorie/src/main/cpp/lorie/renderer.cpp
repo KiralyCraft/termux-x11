@@ -1537,6 +1537,13 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
     uint64_t gpuCopySerial = applyPendingGpuCopiesLocked();
     LoriePresentTag publishedPresentTag{};
     if (readPublishedPresentTag(state, &publishedPresentTag)) {
+        if (state->rendererTimingEnabled && publishedPresentTag.tag) {
+            __atomic_fetch_add(&state->rendererTiming.presentTagReads, 1,
+                               __ATOMIC_RELAXED);
+            __atomic_store_n(
+                &state->rendererTiming.lastPublishedPresentTag,
+                publishedPresentTag.tag, __ATOMIC_RELAXED);
+        }
         uint64_t claimedCpuTag = __atomic_load_n(
             &state->latestPresentTag.claimedTag, __ATOMIC_ACQUIRE);
 
@@ -1545,6 +1552,10 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
                 if (latestContentPresentTag.tag != claimedCpuTag)
                     retirePresentTagUnknown(latestContentPresentTag);
                 latestContentPresentTag = publishedPresentTag;
+                if (state->rendererTimingEnabled)
+                    __atomic_fetch_add(
+                        &state->rendererTiming.presentTagAdvances, 1,
+                        __ATOMIC_RELAXED);
             } else if (publishedPresentTag.tag <
                        latestContentPresentTag.tag) {
                 retirePresentTagUnknown(publishedPresentTag);
@@ -1554,11 +1565,28 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
         } else if (publishedPresentTag.tag >
                    latestContentPresentTag.tag) {
             latestContentPresentTag = publishedPresentTag;
+            if (state->rendererTimingEnabled)
+                __atomic_fetch_add(
+                    &state->rendererTiming.presentTagAdvances, 1,
+                    __ATOMIC_RELAXED);
         }
     }
     LoriePresentTag framePresentTag{};
-    if (latestContentPresentTag.tag > lastSubmittedPresentTag)
+    if (latestContentPresentTag.tag > lastSubmittedPresentTag) {
         framePresentTag = latestContentPresentTag;
+        if (state->rendererTimingEnabled)
+            __atomic_fetch_add(&state->rendererTiming.presentTagEligible, 1,
+                               __ATOMIC_RELAXED);
+    } else if (state->rendererTimingEnabled && latestContentPresentTag.tag) {
+        __atomic_fetch_add(&state->rendererTiming.presentTagSuppressed, 1,
+                           __ATOMIC_RELAXED);
+    }
+    if (state->rendererTimingEnabled) {
+        __atomic_store_n(&state->rendererTiming.lastContentPresentTag,
+                         latestContentPresentTag.tag, __ATOMIC_RELAXED);
+        __atomic_store_n(&state->rendererTiming.lastSubmittedPresentTag,
+                         lastSubmittedPresentTag, __ATOMIC_RELAXED);
+    }
     state->drawRequested = FALSE;
 
     LorieBuffer_bindTexture(buffer);
@@ -1626,8 +1654,16 @@ void Renderer::redrawLocked(bool* waitingForBuffers) {
         printEglError("Failed to swap buffers", __LINE__);
         retirePresentTagUnknown(framePresentTag, gpuCopySerial);
     } else {
-        if (framePresentTag.tag && trackPresent)
+        if (framePresentTag.tag && trackPresent) {
             lastSubmittedPresentTag = framePresentTag.tag;
+            if (state->rendererTimingEnabled) {
+                __atomic_fetch_add(&state->rendererTiming.presentTagAttached,
+                                   1, __ATOMIC_RELAXED);
+                __atomic_store_n(
+                    &state->rendererTiming.lastSubmittedPresentTag,
+                    lastSubmittedPresentTag, __ATOMIC_RELAXED);
+            }
+        }
         if (trackPresent)
             recordPresentFeedback(gpuCopySerial, framePresentTag, submitNs,
                                   eglFrameId);

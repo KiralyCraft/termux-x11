@@ -344,6 +344,16 @@ struct lorie_shared_server_state {
         volatile uint32_t acquireMaxUs;
         volatile uint32_t acquireOverPeriod;
         volatile uint32_t opportunityAdvancedDuringDraw;
+        /* DEBUG: identify where a published X Present tag stops advancing
+         * through the renderer's duplicate-submission guard. */
+        volatile uint32_t presentTagReads;
+        volatile uint32_t presentTagAdvances;
+        volatile uint32_t presentTagEligible;
+        volatile uint32_t presentTagSuppressed;
+        volatile uint32_t presentTagAttached;
+        volatile uint64_t lastPublishedPresentTag;
+        volatile uint64_t lastContentPresentTag;
+        volatile uint64_t lastSubmittedPresentTag;
     } rendererTiming;
 
     /* DEBUG: presentation-timestamp collection is explicitly enabled by the
