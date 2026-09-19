@@ -478,6 +478,7 @@ void handleLorieEvents(int fd, __unused int ready, __unused void *ignored) {
                         event->presentBackendRelease.presentTag,
                         event->presentBackendRelease.deadlineUs,
                         event->presentBackendRelease.expectedUs,
+                        event->presentBackendRelease.opportunityUs,
                         event->presentBackendRelease.opportunityMsc);
                     free(event);
                     return TRUE;

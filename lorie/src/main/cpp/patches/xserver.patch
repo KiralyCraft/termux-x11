@@ -350,7 +350,7 @@ index 271fe32bc8b389498171dc572f17f5cd611ff167..560e24b1614ec9bf0dd9c49a87f05069
 +                          target_msc, divisor, remainder, NULL, 0, NULL);
  }
 diff --git a/present/present_event.c b/present/present_event.c
-index 849732dc880c4627ff80ae8eed6d3794d906e2d6..04afd626ebc302faf8ee36a7b93fe2ad0de0ed90 100644
+index 849732dc880c4627ff80ae8eed6d3794d906e2d6..cae7a996e6a70a4b7d98c513b1ae1251d191e35a 100644
 --- a/present/present_event.c
 +++ b/present/present_event.c
 @@ -23,6 +23,7 @@
@@ -361,7 +361,7 @@ index 849732dc880c4627ff80ae8eed6d3794d906e2d6..04afd626ebc302faf8ee36a7b93fe2ad
  
  static int
  present_free_event(void *data, XID id)
-@@ -176,6 +177,141 @@ present_send_complete_notify(WindowPtr window, CARD8 kind, CARD8 mode, CARD32 se
+@@ -176,6 +177,145 @@ present_send_complete_notify(WindowPtr window, CARD8 kind, CARD8 mode, CARD32 se
          (*complete_notify)(window, kind, mode, serial, ust, msc);
  }
  
@@ -441,7 +441,8 @@ index 849732dc880c4627ff80ae8eed6d3794d906e2d6..04afd626ebc302faf8ee36a7b93fe2ad
 +present_lorie_send_backend_release_notify(
 +    WindowPtr window, const present_lorie_feedback_target_rec *target,
 +    CARD8 mode, CARD32 serial, uint64_t tag, uint64_t deadline_us,
-+    uint64_t expected_us, uint64_t opportunity_msc)
++    uint64_t expected_us, uint64_t opportunity_ust,
++    uint64_t opportunity_msc)
 +{
 +    present_window_priv_ptr window_priv = present_window_priv(window);
 +    present_event_ptr event;
@@ -459,7 +460,8 @@ index 849732dc880c4627ff80ae8eed6d3794d906e2d6..04afd626ebc302faf8ee36a7b93fe2ad
 +            continue;
 +
 +        if (mode == LoriePresentBackendReleaseConsumed &&
-+            deadline_us && expected_us && opportunity_msc) {
++            deadline_us && expected_us && opportunity_ust &&
++            opportunity_msc) {
 +            xPresentCompleteNotify timeline = {
 +                .type = GenericEvent,
 +                .extension = present_request,
@@ -488,8 +490,10 @@ index 849732dc880c4627ff80ae8eed6d3794d906e2d6..04afd626ebc302faf8ee36a7b93fe2ad
 +            .serial = serial,
 +            /* The preceding private event carries deadline/expected time.
 +             * This event retains the ownership boundary and contributes the
-+             * exact renderer-opportunity MSC used to correlate that pair. */
-+            .ust = 0,
++             * exact X-selection opportunity UST/MSC used to correlate that
++             * pair. */
++            .ust = mode == LoriePresentBackendReleaseConsumed ?
++                   opportunity_ust : 0,
 +            .msc = mode == LoriePresentBackendReleaseConsumed ?
 +                   opportunity_msc : tag,
 +        };
@@ -503,7 +507,7 @@ index 849732dc880c4627ff80ae8eed6d3794d906e2d6..04afd626ebc302faf8ee36a7b93fe2ad
  void
  present_send_idle_notify(WindowPtr window, CARD32 serial, PixmapPtr pixmap, struct present_fence *idle_fence)
  {
-@@ -247,6 +383,9 @@ present_select_input(ClientPtr client, XID eid, WindowPtr window, CARD32 mask)
+@@ -247,6 +387,9 @@ present_select_input(ClientPtr client, XID eid, WindowPtr window, CARD32 mask)
      event->window = window;
      event->id = eid;
      event->mask = mask;
@@ -628,7 +632,7 @@ index 68a5878be9c3f9698e4905c36965cf1e5b6efc89..0d31323eea1d7e2b431afc508bb1dc9a
  
      present_pixmap_idle(vblank->pixmap, vblank->window, vblank->serial, vblank->idle_fence);
 diff --git a/present/present_priv.h b/present/present_priv.h
-index 4ad729864759ce67668545299f355337540386eb..ac32c64048cf9f5a6ffa3262682824c3980a8d4d 100644
+index 4ad729864759ce67668545299f355337540386eb..d77b1856829ce9753758dbb0cc6eba5b23a364f4 100644
 --- a/present/present_priv.h
 +++ b/present/present_priv.h
 @@ -24,6 +24,7 @@
@@ -758,7 +762,7 @@ index 4ad729864759ce67668545299f355337540386eb..ac32c64048cf9f5a6ffa3262682824c3
  
  int
  present_notify_msc(WindowPtr window,
-@@ -317,6 +382,22 @@ present_send_config_notify(WindowPtr window, int x, int y, int w, int h, int bw,
+@@ -317,6 +382,23 @@ present_send_config_notify(WindowPtr window, int x, int y, int w, int h, int bw,
  void
  present_send_complete_notify(WindowPtr window, CARD8 kind, CARD8 mode, CARD32 serial, uint64_t ust, uint64_t msc);
  
@@ -776,12 +780,13 @@ index 4ad729864759ce67668545299f355337540386eb..ac32c64048cf9f5a6ffa3262682824c3
 +present_lorie_send_backend_release_notify(
 +    WindowPtr window, const present_lorie_feedback_target_rec *target,
 +    CARD8 mode, CARD32 serial, uint64_t tag, uint64_t deadline_us,
-+    uint64_t expected_us, uint64_t opportunity_msc);
++    uint64_t expected_us, uint64_t opportunity_ust,
++    uint64_t opportunity_msc);
 +
  void
  present_send_idle_notify(WindowPtr window, CARD32 serial, PixmapPtr pixmap, present_fence_ptr idle_fence);
  
-@@ -469,7 +550,8 @@ present_vblank_init(present_vblank_ptr vblank,
+@@ -469,7 +551,8 @@ present_vblank_init(present_vblank_ptr vblank,
                      present_notify_ptr notifies,
                      int num_notifies,
                      uint64_t target_msc,
@@ -791,7 +796,7 @@ index 4ad729864759ce67668545299f355337540386eb..ac32c64048cf9f5a6ffa3262682824c3
  
  present_vblank_ptr
  present_vblank_create(WindowPtr window,
-@@ -487,7 +569,8 @@ present_vblank_create(WindowPtr window,
+@@ -487,7 +570,8 @@ present_vblank_create(WindowPtr window,
                        present_notify_ptr notifies,
                        int num_notifies,
                        uint64_t target_msc,
@@ -983,7 +988,7 @@ index 2c29aafd23509143b491cc9c6209234faa026b33..42c57618667f0ae00fb161a19276f914
      return window_priv;
  }
 diff --git a/present/present_vblank.c b/present/present_vblank.c
-index a9f17d4b2be374257b44199959c5ae1beb2d3972..b4cc3bab0f2ae2f96e601b6fdf3be0ca001d887c 100644
+index a9f17d4b2be374257b44199959c5ae1beb2d3972..5fb83f5524b9443492fb843797dbc9d20f7e630f 100644
 --- a/present/present_vblank.c
 +++ b/present/present_vblank.c
 @@ -22,6 +22,31 @@
@@ -1010,7 +1015,7 @@ index a9f17d4b2be374257b44199959c5ae1beb2d3972..b4cc3bab0f2ae2f96e601b6fdf3be0ca
 +            present_lorie_send_backend_release_notify(
 +                vblank->window, &vblank->lorie_feedback,
 +                LoriePresentBackendReleaseRetired,
-+                vblank->serial, 0, 0, 0, 0);
++                vblank->serial, 0, 0, 0, 0, 0);
 +    }
 +    vblank->lorie_feedback_terminal_sent = TRUE;
 +}

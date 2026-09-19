@@ -34,6 +34,9 @@
  * experimental servers publish the payload merely because they use the
  * Choreographer callback internally. */
 #define LORIE_PRESENT_CAP_TIMELINE_NOTIFY          (1u << 26)
+/* Version 2 also identifies the callback at which X contents were selected.
+ * Android's later render deadline is not that X-side selection boundary. */
+#define LORIE_PRESENT_CAP_TIMELINE_OPPORTUNITY     (1u << 25)
 
 /* Per-request opt-in.  The matching Mesa loader only sets this after the
  * capability above was advertised, so unmodified servers never see it. */
@@ -84,6 +87,7 @@ typedef struct __attribute__((aligned(8))) {
 typedef struct __attribute__((aligned(8))) {
     uint64_t deadlineUs;
     uint64_t expectedUs;
+    uint64_t opportunityUs;
     uint64_t opportunityMsc;
 } LorieFrameTimeline;
 
@@ -113,6 +117,7 @@ void lorieHandlePresentBackendRelease(uint8_t mode,
                                       LoriePresentTag present_tag,
                                       uint64_t deadline_us,
                                       uint64_t expected_us,
+                                      uint64_t opportunity_us,
                                       uint64_t opportunity_msc);
 void lorieChoreographerStart(AChoreographer *choreographer);
 void lorieActivityConnected(void);
@@ -272,6 +277,7 @@ typedef union {
          * compatibility path and never establish producer completion. */
         uint64_t deadlineUs;
         uint64_t expectedUs;
+        uint64_t opportunityUs;
         uint64_t opportunityMsc;
     } presentBackendRelease;
     struct {
@@ -339,6 +345,7 @@ struct lorie_shared_server_state {
         uint32_t reserved;
         uint64_t deadlineUs __attribute__((aligned(8)));
         uint64_t expectedUs;
+        uint64_t opportunityUs;
         uint64_t opportunityMsc;
     } latestFrameTimeline;
 

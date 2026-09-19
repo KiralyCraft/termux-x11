@@ -166,6 +166,8 @@ static bool readFrameTimeline(const lorie_shared_server_state* state,
             &state->latestFrameTimeline.deadlineUs, __ATOMIC_RELAXED);
         out->expectedUs = __atomic_load_n(
             &state->latestFrameTimeline.expectedUs, __ATOMIC_RELAXED);
+        out->opportunityUs = __atomic_load_n(
+            &state->latestFrameTimeline.opportunityUs, __ATOMIC_RELAXED);
         out->opportunityMsc = __atomic_load_n(
             &state->latestFrameTimeline.opportunityMsc, __ATOMIC_RELAXED);
         after = __atomic_load_n(&state->latestFrameTimeline.version,
@@ -174,7 +176,8 @@ static bool readFrameTimeline(const lorie_shared_server_state* state,
             break;
     }
 
-    return out->deadlineUs && out->expectedUs && out->opportunityMsc;
+    return out->deadlineUs && out->expectedUs && out->opportunityUs &&
+        out->opportunityMsc;
 }
 
 /* DEBUG: Stage-E validation only.  This deliberately does not advertise a
@@ -426,6 +429,7 @@ void Renderer::notifyPresentBackendRelease(
     if (mode == LORIE_PRESENT_BACKEND_RELEASE_CONSUMED && timeline) {
         event.presentBackendRelease.deadlineUs = timeline->deadlineUs;
         event.presentBackendRelease.expectedUs = timeline->expectedUs;
+        event.presentBackendRelease.opportunityUs = timeline->opportunityUs;
         event.presentBackendRelease.opportunityMsc = timeline->opportunityMsc;
     }
     write(*connFdPtr, &event, sizeof(event));

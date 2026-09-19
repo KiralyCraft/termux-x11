@@ -661,6 +661,8 @@ static Bool lorieRedraw(__unused ClientPtr pClient, __unused void *closure) {
         __atomic_store_n(&pvfb->state->latestFrameTimeline.expectedUs,
                          (uint64_t) timelineExpectedNs / 1000,
                          __ATOMIC_RELAXED);
+        __atomic_store_n(&pvfb->state->latestFrameTimeline.opportunityUs,
+                         vblankUst, __ATOMIC_RELAXED);
         __atomic_store_n(&pvfb->state->latestFrameTimeline.opportunityMsc,
                          pvfb->current_msc, __ATOMIC_RELAXED);
         __atomic_store_n(&pvfb->state->latestFrameTimeline.version,
@@ -797,6 +799,7 @@ void lorieHandlePresentBackendRelease(uint8_t mode,
                                       LoriePresentTag present_tag,
                                       uint64_t deadline_us,
                                       uint64_t expected_us,
+                                      uint64_t opportunity_us,
                                       uint64_t opportunity_msc) {
     WindowPtr window = NULL;
     present_lorie_feedback_target_rec target = {
@@ -816,7 +819,7 @@ void lorieHandlePresentBackendRelease(uint8_t mode,
                         DixReadAccess) == Success)
         present_lorie_send_backend_release_notify(
             window, &target, mode, present_tag.serial, present_tag.tag,
-            deadline_us, expected_us, opportunity_msc);
+            deadline_us, expected_us, opportunity_us, opportunity_msc);
 }
 
 static CARD32 lorieFramecounter(unused OsTimerPtr timer, unused CARD32 time, unused void *arg) {
@@ -1253,7 +1256,8 @@ static Bool lorieScreenInit(ScreenPtr pScreen, unused int argc, unused char **ar
                                     LORIE_PRESENT_CAP_VBLANK_COMPLETE;
     if (lorieChoreographerApi.available)
         loriePresentInfo.capabilities |= LORIE_PRESENT_CAP_FRAME_TIMELINE |
-                                         LORIE_PRESENT_CAP_TIMELINE_NOTIFY;
+                                         LORIE_PRESENT_CAP_TIMELINE_NOTIFY |
+                                         LORIE_PRESENT_CAP_TIMELINE_OPPORTUNITY;
     if (pvfb->state->presentFeedbackEnabled)
         loriePresentInfo.capabilities |= LORIE_PRESENT_CAP_ACTUAL_FEEDBACK;
 
@@ -1456,7 +1460,8 @@ void loriePublishPresentTag(uint64_t tag, uint32_t window, uint32_t serial,
                                        0, 0, 0, previous, 0, 0, 0);
         if (previous.options & LORIE_PRESENT_OPTION_BACKEND_RELEASE)
             lorieHandlePresentBackendRelease(
-                LORIE_PRESENT_BACKEND_RELEASE_RETIRED, previous, 0, 0, 0);
+                LORIE_PRESENT_BACKEND_RELEASE_RETIRED, previous,
+                0, 0, 0, 0);
     }
     version = __atomic_load_n(&pvfb->state->latestPresentTag.version,
                               __ATOMIC_RELAXED);
