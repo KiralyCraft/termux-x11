@@ -19,7 +19,9 @@
 #include <X11/Xmd.h>
 #include <sys/wait.h>
 #include <present.h>
+#include <linux/ashmem.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <dri3.h>
 #include <sys/stat.h>
 #include <dlfcn.h>
@@ -246,13 +248,22 @@ void OsVendorInit(void) {
 static Bool lorieSetRendererWakeupCondWorkProc(__unused ClientPtr client, void* closure) {
     int fd = (int) (intptr_t) closure;
     struct stat statbuf = {0};
+    off_t regionSize = 0;
     size_t mappingSize = sizeof(pthread_cond_t);
     void *newMapping;
     pthread_cond_t *newCond;
     LorieRendererWakeup *newWakeup = NULL;
 
-    if (fstat(fd, &statbuf) == 0 &&
-        statbuf.st_size >= (off_t) sizeof(LorieRendererWakeup))
+    if (fstat(fd, &statbuf) == 0)
+        regionSize = statbuf.st_size;
+    /* Android ashmem reports st_size == 0 on this kernel.  Query its stable
+     * ioctl as a fallback; memfd-backed regions continue to use fstat. */
+    if (regionSize < (off_t) sizeof(LorieRendererWakeup)) {
+        int ashmemSize = ioctl(fd, ASHMEM_GET_SIZE, NULL);
+        if (ashmemSize > 0)
+            regionSize = ashmemSize;
+    }
+    if (regionSize >= (off_t) sizeof(LorieRendererWakeup))
         mappingSize = sizeof(LorieRendererWakeup);
     newMapping = mmap(NULL, mappingSize, PROT_READ|PROT_WRITE, MAP_SHARED,
                       fd, 0);
@@ -287,8 +298,9 @@ static Bool lorieSetRendererWakeupCondWorkProc(__unused ClientPtr client, void* 
     }
 
     if (lorieServerDebugEnabled)
-        log(INFO, "DEBUG: renderer wakeup protocol: %s",
-            newWakeup ? "locked-sequence" : "legacy-condvar");
+        log(INFO, "DEBUG: renderer wakeup protocol: %s (region=%lld extended=%zu)",
+            newWakeup ? "locked-sequence" : "legacy-condvar",
+            (long long) regionSize, sizeof(LorieRendererWakeup));
 
     if (oldMapping)
         munmap(oldMapping, oldMappingSize);
